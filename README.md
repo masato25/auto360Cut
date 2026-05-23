@@ -42,6 +42,13 @@ sentrysearch autocut ./chain_trip/LRV_20260415_155421_01_001.lrv \
   --api-base-url http://192.168.0.207:8080 \
   -o ~/Desktop/output.mp4
 
+# 高畫質輸出：索引用 LRV，修剪用 HQ 來源
+sentrysearch autocut ./chain_trip/LRV_20260415_155421_01_001.lrv \
+  --prompt "interesting moments" --count 3 \
+  --hq-dir ./chain_trip/ \
+  --api-base-url http://192.168.0.207:8080 \
+  -o ~/Desktop/output_hq.mp4
+
 # 顯示已索引的時間軸
 sentrysearch report --backend local-api
 ```
