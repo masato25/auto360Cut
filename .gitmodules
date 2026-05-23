@@ -1,0 +1,3 @@
+[submodule "sentrysearch"]
+	path = sentrysearch
+	url = https://github.com/ssrajadh/sentrysearch.git
