@@ -1,6 +1,7 @@
-# AutoCut — 360 行車記錄器自動剪輯
+# autoCut
 
 基於 [sentrysearch](https://github.com/ssrajadh/sentrysearch) 的本地 AI 影片處理工具。
+
 
 ## 快速開始
 
