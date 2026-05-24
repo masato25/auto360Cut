@@ -324,10 +324,10 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
             "start_time": chunk["start_time"],
             "end_time": chunk["end_time"],
             "caption": meta.get("caption", ""),
-            "is_360": meta.get("is_360", False),
+            "is_360": is_360 or meta.get("is_360", False),
             "best_yaw": meta.get("best_yaw", 0),
             "best_direction": meta.get("best_direction", ""),
-            "projection": meta.get("projection", projection or "equirect"),
+            "projection": projection or meta.get("projection", "equirect"),
         }
         store.add_chunk(chunk_id, vec, chunk_meta)
         new_chunks += 1
