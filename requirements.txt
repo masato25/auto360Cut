@@ -1,0 +1,13 @@
+# autoCut bootstrap dependencies
+#
+# Install this file inside the autoCut root virtual environment first,
+# then install the editable sentrysearch package with the desired extras.
+#
+# Example:
+#   python -m pip install -r requirements.txt
+#   python -m pip install -e "./sentrysearch[local-api]"
+
+click>=8.1
+python-dotenv>=1.0
+setuptools>=68
+wheel>=0.42

@@ -47,12 +47,38 @@ Insta360 原始素材
 
 ## 安裝
 
+### 1. 建立 virtual environment
+
+建議使用 Python 3.11 或 3.12。
+
 ```bash
 cd /Users/geassbot/Movies/autoCut
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install click python-dotenv
+python -m pip install --upgrade pip
+```
+
+### 2. 安裝依賴
+
+#### 建議方式：使用已整理好的 requirements
+
+如果你是要跑目前 autoCut 常用的 **local-api** 工作流：
+
+```bash
+python -m pip install -r requirements-local-api.txt
+```
+
+這會安裝：
+- autoCut 啟動所需的基礎套件
+- `sentrysearch` editable package
+- `local-api` 模式需要的依賴
+
+#### 手動安裝方式
+
+如果你想分開安裝，也可以：
+
+```bash
+python -m pip install -r requirements.txt
 python -m pip install -e "./sentrysearch[local-api]"
 ```
 
@@ -133,6 +159,17 @@ python -m pip install -e "./sentrysearch[local-api]"
 
 ### `--yaw`
 直接指定最後輸出使用的 yaw 角度；若有設定，優先權高於 `--view`。
+
+## 安裝檔說明
+
+- `requirements.txt`
+  - autoCut root venv 的基礎安裝需求
+  - 包含 pip 常用建置工具與最基本啟動依賴
+- `requirements-local-api.txt`
+  - 建議日常使用的安裝方式
+  - 會直接安裝 `./sentrysearch[local-api]`
+
+如果之後你要支援其他模式（例如 `local`、`qwen-cloud`），可以照同樣模式再拆出新的 requirements 檔。
 
 ## 文件
 
