@@ -205,35 +205,7 @@ def autocut_command(
     )
 
     if face is not None:
-        click.echo(f"Re-ranking by face similarity: {face}", err=True)
-        try:
-            from sentrysearch.face_utils import encode_reference_face, face_similarity, deserialize_encodings
-            import json
-            ref_enc = encode_reference_face(str(face.resolve()))
-            if ref_enc is None:
-                click.echo("  No face detected in reference image.", err=True)
-            else:
-                scored: list[tuple[dict, float]] = []
-                for s in selected:
-                    raw = s.get("face_encodings", "")
-                    if not raw:
-                        scored.append((s, 0.0))
-                        continue
-                    try:
-                        stored = deserialize_encodings(json.loads(raw))
-                    except Exception:
-                        scored.append((s, 0.0))
-                        continue
-                    best_score = max((face_similarity(ref_enc, stored_f) for stored_f in stored), default=0.0)
-                    scored.append((s, best_score))
-                scored.sort(key=lambda x: x[1], reverse=True)
-                selected = [s for s, _ in scored]
-                click.echo(f"  Face re-ranking applied (best score: {scored[0][1]:.3f})", err=True)
-                for s, score in scored:
-                    click.echo(f"    face_score={score:.3f}  [{_fmt_time(s['start_time'])}-{_fmt_time(s['end_time'])}] {s.get('caption', '')[:60]}", err=True)
-        except ImportError as exc:
-            click.echo(f"  face_recognition not available: {exc}", err=True)
-            click.echo("  Install: pip install face_recognition", err=True)
+        selected = _rerank_by_face(selected, face)
 
     _render_autocut(
         selected,
@@ -260,6 +232,61 @@ def upstream(ctx: click.Context) -> None:
 def _fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
+
+
+def _rerank_by_face(selected: list[dict], face: Path) -> list[dict]:
+    """Stable face-based re-ranking.
+
+    Keep the normal semantic-search result unchanged when no selected clip has
+    usable face metadata.  This prevents `--face` from changing the output just
+    because face data was missing or from sorting every clip with an equal 0.0
+    score.
+    """
+    click.echo(f"Re-ranking by face similarity: {face}", err=True)
+    try:
+        from sentrysearch.face_utils import deserialize_encodings, encode_reference_face, face_similarity
+        import json
+    except ImportError as exc:
+        click.echo(f"  face_recognition not available: {exc}", err=True)
+        click.echo("  Install: pip install face_recognition", err=True)
+        return selected
+
+    ref_enc = encode_reference_face(str(face.resolve()))
+    if ref_enc is None:
+        click.echo("  No face detected in reference image. Keeping original clip order.", err=True)
+        return selected
+
+    scored: list[tuple[int, dict, float]] = []
+    positive_scores = 0
+    for idx, s in enumerate(selected):
+        raw = s.get("face_encodings", "")
+        if not raw:
+            scored.append((idx, s, 0.0))
+            continue
+        try:
+            stored = deserialize_encodings(json.loads(raw))
+        except Exception:
+            scored.append((idx, s, 0.0))
+            continue
+        best_score = max((face_similarity(ref_enc, stored_f) for stored_f in stored), default=0.0)
+        if best_score > 0.0:
+            positive_scores += 1
+        scored.append((idx, s, best_score))
+
+    if positive_scores == 0:
+        click.echo("  No usable face matches in selected clips. Keeping original clip order.", err=True)
+        return selected
+
+    scored.sort(key=lambda x: (-x[2], x[0]))
+    click.echo(f"  Face re-ranking applied (best score: {scored[0][2]:.3f})", err=True)
+    for _idx, s, score in scored:
+        click.echo(
+            f"    face_score={score:.3f}  "
+            f"[{_fmt_time(s['start_time'])}-{_fmt_time(s['end_time'])}] "
+            f"{s.get('caption', '')[:60]}",
+            err=True,
+        )
+    return [s for _idx, s, _score in scored]
 
 
 def _resolve_hq_source(video_path: str, hq_source: str | None, hq_dir: str | None) -> str | None:
@@ -529,16 +556,25 @@ def _choose_best_360_view(embedder, captions_by_view: dict[str, str], prompt: st
     query_vec = embedder.embed_query(prompt, verbose=verbose)
     best_view = "front"
     best_score = float("-inf")
+    scores: list[tuple[str, float | None]] = []
     for view, caption in captions_by_view.items():
         if not caption:
+            scores.append((view, None))
             continue
         caption_vec = embedder.embed_query(caption, verbose=False)
         score = _cosine_similarity(query_vec, caption_vec)
-        if verbose:
-            click.echo(f"    [360] match {view}: {score:.4f}", err=True)
+        scores.append((view, score))
         if score > best_score:
             best_score = score
             best_view = view
+
+    click.echo("    [360] viewport scores:", err=True)
+    for view, score in scores:
+        marker = " ← selected" if view == best_view and score is not None else ""
+        if score is None:
+            click.echo(f"      {view:>5}: no caption", err=True)
+        else:
+            click.echo(f"      {view:>5}: {score:.4f}{marker}", err=True)
     return best_view
 
 
@@ -601,6 +637,7 @@ def _load_rows(video_path: str, *, backend: str, model: str | None) -> list[dict
                 "best_yaw": meta.get("best_yaw", 0),
                 "best_direction": meta.get("best_direction", ""),
                 "projection": meta.get("projection", "equirect"),
+                "face_encodings": meta.get("face_encodings", ""),
             })
     rows.sort(key=lambda r: r["start_time"])
     return rows
