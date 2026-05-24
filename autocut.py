@@ -17,10 +17,12 @@ try:
 except ModuleNotFoundError:
     sys.stderr.write(
         "Missing dependency: python-dotenv\n"
-        "Install the project package and its local-api extras first:\n"
-        "  ./.venv/bin/python -m pip install -e ./sentrysearch[local-api]\n"
-        "or with uv:\n"
-        "  uv pip install -e ./sentrysearch[local-api]\n"
+        "Install the base project dependencies first:\n"
+        "  ./.venv/bin/python -m pip install -r requirements.txt\n\n"
+        "Then install the sentrysearch editable package with the backend you need:\n"
+        "  local-api:   ./.venv/bin/python -m pip install -e './sentrysearch[local-api]'\n"
+        "  qwen-cloud:  ./.venv/bin/python -m pip install -e './sentrysearch[qwen-cloud]'\n"
+        "  local:       ./.venv/bin/python -m pip install -e './sentrysearch[local]'\n\n"
         "Then run autocut with the project virtualenv:\n"
         "  ./.venv/bin/python autocut.py ...\n"
     )
@@ -34,24 +36,43 @@ if str(SUBMODULE) not in sys.path:
 
 from sentrysearch.cli import cli as upstream_cli  # noqa: E402
 from sentrysearch.chunker import _get_ffmpeg_executable  # noqa: E402
-import sentrysearch.local_api_embedder as local_api_embedder  # noqa: E402
-from sentrysearch.local_api_embedder import LocalApiEmbedder  # noqa: E402
-from sentrysearch.openai_compat import DEFAULT_API_BASE, LocalLLMClient  # noqa: E402
-from sentrysearch.store import SentryStore, detect_index  # noqa: E402
+from sentrysearch.embedder import get_embedder, reset_embedder  # noqa: E402
+from sentrysearch.qwen_cloud_embedder import (  # noqa: E402
+    DashScopeDependencyError,
+    default_dashscope_embedding_model,
+)
+from sentrysearch.search import search_footage  # noqa: E402
+from sentrysearch.store import SentryStore  # noqa: E402
 from sentrysearch.trimmer import trim_clip  # noqa: E402
-from sentrysearch.v360_utils import convert_clip_to_flat, detect_360_projection  # noqa: E402
 
 load_dotenv(ROOT / ".env")
+
+
+def detect_360_projection(video_path: str) -> str | None:
+    try:
+        from sentrysearch.v360_utils import detect_360_projection as _detect_360_projection
+    except ModuleNotFoundError:
+        return None
+    return _detect_360_projection(video_path)
+
+
+def convert_clip_to_flat(*args, **kwargs):
+    try:
+        from sentrysearch.v360_utils import convert_clip_to_flat as _convert_clip_to_flat
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "360 viewport conversion is unavailable in the current sentrysearch version: "
+            "missing sentrysearch.v360_utils"
+        ) from exc
+    return _convert_clip_to_flat(*args, **kwargs)
 
 DEFAULT_PROMPT = (
     "first-person perspective or over-the-shoulder user viewpoint moments"
 )
-DEFAULT_VIEW_PROMPT = (
-    "first-person perspective or over-the-shoulder user viewpoint, "
-    "prefer the direction the user is facing"
-)
 VIEW_CHOICES = ["auto", "front", "right", "back", "left"]
 VIEW_TO_YAW = {"front": 0, "right": 90, "back": 180, "left": 270}
+DEFAULT_BACKEND = os.environ.get("AUTOCUT_BACKEND", "local-api")
+DEFAULT_LOCAL_MODEL = os.environ.get("AUTOCUT_LOCAL_MODEL", "qwen8b")
 
 
 @click.group(
@@ -69,8 +90,6 @@ def cli() -> None:
 @click.argument("video", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--prompt", default=DEFAULT_PROMPT, show_default=True,
               help="Instruction for selecting which clips to keep.")
-@click.option("--view-prompt", default=DEFAULT_VIEW_PROMPT, show_default=True,
-              help="Instruction for choosing the viewport direction for 360 chunks during indexing.")
 @click.option("--view", type=click.Choice(VIEW_CHOICES), default="auto", show_default=True,
               help="Override final 360 output view for all selected clips.")
 @click.option("--yaw", type=float, default=None,
@@ -80,8 +99,15 @@ def cli() -> None:
 @click.option("-o", "--output", default="autocut_output.mp4", show_default=True,
               type=click.Path(dir_okay=False, path_type=Path),
               help="Output path for the edited video.")
-@click.option("--api-base-url", default=None,
-              help="Local API base URL (default: env LOCAL_API_BASE or project default).")
+@click.option("--backend", type=click.Choice(["local", "local-api", "qwen-cloud", "gemini"]),
+              default=DEFAULT_BACKEND, show_default=True,
+              help="Embedding/search backend used for indexing and clip selection. Default is local-api for self-hosted HTTP services (llama.cpp).")
+@click.option("--model", default=None,
+              help="Model for --backend local, or override local model alias/ID.")
+@click.option("--dashscope-model", default=None,
+              help="Model for --backend qwen-cloud (default from sentrysearch/env).")
+@click.option("--quantize/--no-quantize", default=None,
+              help="Only for --backend local: enable or disable quantization explicitly.")
 @click.option("--hq-source", default=None,
               type=click.Path(exists=True, dir_okay=False, path_type=Path),
               help="High-quality source file to trim from instead of VIDEO.")
@@ -96,12 +122,14 @@ def cli() -> None:
 def autocut_command(
     video: Path,
     prompt: str,
-    view_prompt: str,
     view: str,
     yaw: float | None,
     count: int,
     output: Path,
-    api_base_url: str | None,
+    backend: str,
+    model: str | None,
+    dashscope_model: str | None,
+    quantize: bool | None,
     hq_source: Path | None,
     hq_dir: Path | None,
     is_360: bool | None,
@@ -114,6 +142,9 @@ def autocut_command(
 
     video_path = str(video.resolve())
     output_path = str(output.expanduser().resolve())
+
+    _validate_backend_options(backend, model, dashscope_model)
+    resolved_model = _resolve_model(backend, model, dashscope_model)
 
     projection = None
     if is_360 is None:
@@ -128,21 +159,29 @@ def autocut_command(
 
     _index_video(
         video_path=video_path,
-        api_base_url=api_base_url,
+        backend=backend,
+        model=resolved_model,
+        quantize=quantize,
         is_360=bool(is_360),
         projection=projection,
-        view_prompt=view_prompt,
         force_reindex=force_reindex,
         verbose=verbose,
     )
 
-    rows = _load_rows(video_path)
+    rows = _load_rows(video_path, backend=backend, model=resolved_model)
     if not rows:
         click.echo("No captions found for this video. Indexing may have failed.")
         raise SystemExit(1)
 
-    selected = _select_clips(rows, prompt=prompt, count=count,
-                             api_base_url=api_base_url, verbose=verbose)
+    selected = _select_clips(
+        rows,
+        prompt=prompt,
+        count=count,
+        backend=backend,
+        model=resolved_model,
+        quantize=quantize,
+        verbose=verbose,
+    )
     _render_autocut(
         selected,
         source_video=video_path,
@@ -209,42 +248,53 @@ def _resolve_hq_source(video_path: str, hq_source: str | None, hq_dir: str | Non
     )
 
 
-def _build_view_prompt(view_prompt: str) -> str:
-    goal = view_prompt.strip()
-    return (
-        "This is a 360-degree video with frames from different viewing directions. "
-        "Below each direction is labeled with its frames:\n\n"
-        "Front (looking ahead):\n"
-        "Right (90 degrees to the right):\n"
-        "Back (behind):\n"
-        "Left (90 degrees to the left):\n\n"
-        f"Choose the direction that best matches this editing request: \"{goal}\". "
-        "Prefer the requested viewpoint/content over generic interestingness. "
-        "Then describe ONLY that chosen direction in 1-2 concise sentences, including the main subject, actions, setting, and notable objects/events.\n\n"
-        "On the final line, write exactly: 'Best direction: <front|right|back|left>'"
-    )
+def _validate_backend_options(backend: str, model: str | None, dashscope_model: str | None) -> None:
+    if model is not None and dashscope_model is not None:
+        raise click.UsageError("Use only one of --model or --dashscope-model, not both.")
+    if backend in {"local", "local-api"} and dashscope_model is not None:
+        raise click.UsageError("--dashscope-model only works with --backend qwen-cloud.")
+    if backend in {"gemini", "qwen-cloud"} and model is not None:
+        raise click.UsageError("--model only works with --backend local or local-api.")
+    if backend == "gemini" and dashscope_model is not None:
+        raise click.UsageError("--dashscope-model does not apply to --backend gemini.")
 
 
-def _index_video(*, video_path: str, api_base_url: str | None, is_360: bool,
-                 projection: str | None, view_prompt: str,
+def _resolve_model(backend: str, model: str | None, dashscope_model: str | None) -> str | None:
+    if backend in {"local", "local-api"}:
+        return model or None
+    if backend == "qwen-cloud":
+        return dashscope_model or default_dashscope_embedding_model()
+    return None
+
+
+def _index_video(*, video_path: str, backend: str, model: str | None,
+                 quantize: bool | None, is_360: bool,
+                 projection: str | None,
                  force_reindex: bool, verbose: bool) -> None:
     from sentrysearch.chunker import chunk_video
 
     click.echo("Indexing video...")
-    original_360_prompt = local_api_embedder.CAPTION_360_PROMPT
-    if is_360:
-        local_api_embedder.CAPTION_360_PROMPT = _build_view_prompt(view_prompt)
-
+    reset_embedder()
+    embedder_kwargs: dict = {}
+    if backend == "local":
+        embedder_kwargs["model"] = model
+        embedder_kwargs["quantize"] = quantize
+    elif backend == "local-api":
+        embedder_kwargs["model"] = model
+    elif backend == "qwen-cloud":
+        embedder_kwargs["model"] = model
     try:
-        embedder = LocalApiEmbedder(
-            api_base_url=api_base_url,
-            is_360=is_360,
-            projection=projection,
-        )
-    finally:
-        local_api_embedder.CAPTION_360_PROMPT = original_360_prompt
+        embedder = get_embedder(backend=backend, **embedder_kwargs)
+    except DashScopeDependencyError as exc:
+        raise click.ClickException(
+            "qwen-cloud backend requires the dashscope SDK.\n\n"
+            "Install it in the autoCut root virtualenv with one of:\n"
+            "  ./.venv/bin/python -m pip install -e './sentrysearch[qwen-cloud]'\n"
+            "  ./.venv/bin/python -m pip install -r requirements-qwen-cloud.txt\n\n"
+            f"Original error: {exc}"
+        ) from exc
 
-    store = SentryStore(backend="local-api", model=None)
+    store = SentryStore(backend=backend, model=model)
 
     if force_reindex:
         removed = store.remove_file(video_path)
@@ -258,7 +308,7 @@ def _index_video(*, video_path: str, api_base_url: str | None, is_360: bool,
         if store.has_chunk(chunk_id):
             if is_360 and not force_reindex:
                 click.echo(
-                    f"Skipping existing chunk @ {_fmt_time(chunk['start_time'])}; use --force-reindex after changing --view-prompt.",
+                    f"Skipping existing chunk @ {_fmt_time(chunk['start_time'])}; use --force-reindex to rebuild cached chunks.",
                     err=True,
                 )
             continue
@@ -291,11 +341,8 @@ def _index_video(*, video_path: str, api_base_url: str | None, is_360: bool,
     click.echo(f"Indexed {new_chunks} new chunk(s).")
 
 
-def _load_rows(video_path: str) -> list[dict]:
-    backend, detected_model = detect_index()
-    if backend is None:
-        return []
-    store = SentryStore(backend=backend, model=detected_model)
+def _load_rows(video_path: str, *, backend: str, model: str | None) -> list[dict]:
+    store = SentryStore(backend=backend, model=model)
     all_data = store.collection.get(include=["metadatas"])
     rows: list[dict] = []
     for i, _cid in enumerate(all_data.get("ids", [])):
@@ -321,41 +368,57 @@ def _load_rows(video_path: str) -> list[dict]:
 
 
 def _select_clips(rows: list[dict], *, prompt: str, count: int,
-                  api_base_url: str | None, verbose: bool) -> list[dict]:
-    click.echo(f"\nAsking LLM to select {count} clips for: '{prompt}'...")
-    seg_lines = [
-        f"#{r['idx']}: {_fmt_time(r['start_time'])}-{_fmt_time(r['end_time'])} - {r['caption']}"
+                  backend: str, model: str | None,
+                  quantize: bool | None, verbose: bool) -> list[dict]:
+    click.echo(f"\nSelecting top {count} clips for: '{prompt}'...")
+    reset_embedder()
+    embedder_kwargs: dict = {}
+    if backend == "local":
+        embedder_kwargs["model"] = model
+        embedder_kwargs["quantize"] = quantize
+    elif backend == "local-api":
+        embedder_kwargs["model"] = model
+    elif backend == "qwen-cloud":
+        embedder_kwargs["model"] = model
+    try:
+        get_embedder(backend=backend, **embedder_kwargs)
+    except DashScopeDependencyError as exc:
+        raise click.ClickException(
+            "qwen-cloud backend requires the dashscope SDK.\n\n"
+            "Install it in the autoCut root virtualenv with one of:\n"
+            "  ./.venv/bin/python -m pip install -e './sentrysearch[qwen-cloud]'\n"
+            "  ./.venv/bin/python -m pip install -r requirements-qwen-cloud.txt\n\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    store = SentryStore(backend=backend, model=model)
+    matches = search_footage(prompt, store, n_results=max(count * 4, count), verbose=verbose)
+    selected: list[dict] = []
+    seen_ranges: set[tuple[float, float]] = set()
+    row_lookup = {
+        (float(r["start_time"]), float(r["end_time"])): r
         for r in rows
-    ]
-    llm_prompt = (
-        "You are a video editor. Given these video segments with descriptions:\n\n"
-        + "\n".join(seg_lines)
-        + f"\n\nSelect the top {count} segments that best match: \"{prompt}\".\n"
-          "Return only the index numbers (like 0, 1, 2), one per line, nothing else."
-    )
-    client = LocalLLMClient(api_base_url=api_base_url or DEFAULT_API_BASE)
-    resp = client._client.chat.completions.create(
-        model=client.model,
-        messages=[{"role": "user", "content": [{"type": "text", "text": llm_prompt}]}],
-        max_tokens=128,
-        temperature=0.1,
-    )
-    answer = resp.choices[0].message.content or ""
-    if verbose:
-        click.echo(f"LLM response:\n{answer}")
+    }
+    for match in matches:
+        key = (float(match["start_time"]), float(match["end_time"]))
+        row = row_lookup.get(key)
+        if row is None or key in seen_ranges:
+            continue
+        selected.append(row)
+        seen_ranges.add(key)
+        if len(selected) >= count:
+            break
 
-    selected_indices = []
-    valid_ids = {r["idx"]: r for r in rows}
-    for token in re.findall(r"\d+", answer):
-        idx = int(token)
-        if idx in valid_ids:
-            selected_indices.append(idx)
-    selected_indices = list(dict.fromkeys(selected_indices))[:count]
-    if not selected_indices:
-        click.secho("LLM did not return valid indices, falling back to first N.", fg="yellow")
-        selected_indices = [r["idx"] for r in rows[:count]]
+    if len(selected) < count:
+        for row in rows:
+            key = (float(row["start_time"]), float(row["end_time"]))
+            if key in seen_ranges:
+                continue
+            selected.append(row)
+            seen_ranges.add(key)
+            if len(selected) >= count:
+                break
 
-    selected = [valid_ids[idx] for idx in selected_indices]
     click.secho(f"\nSelected {len(selected)} clips:", fg="green", bold=True)
     for s in selected:
         click.echo(f"  [{_fmt_time(s['start_time'])}-{_fmt_time(s['end_time'])}] {s['caption'][:100]}")

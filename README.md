@@ -2,7 +2,7 @@
 
 autoCut 是一個用來把 360 / 一般影片做「語意搜尋」與「自動剪輯」的本地工作流專案。
 
-它以 [`sentrysearch`](./sentrysearch/) 為核心，補上更適合 360 相機素材的使用方式：
+它以 [`sentrysearch`](./sentrysearch/README.md)（forked from [ssrajadh/sentrysearch](https://github.com/ssrajadh/sentrysearch)）為核心，補上更適合 360 相機素材的使用方式：
 
 - 用 **LRV 低解析代理檔**做 AI 分析與索引
 - 用 **HQ 高畫質 MP4** 做最後輸出
@@ -62,16 +62,22 @@ python -m pip install --upgrade pip
 
 #### 建議方式：使用已整理好的 requirements
 
-如果你是要跑目前 autoCut 常用的 **local-api** 工作流：
+如果你是像目前這個專案實際使用方式一樣，接 **自己本地啟動的 llama.cpp / OpenAI 相容 HTTP 服務**（例如 `http://192.168.0.207:8080`，模型為 `ggml-org_Qwen2.5-VL-7B-Instruct-GGUF_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`），建議優先使用：
 
 ```bash
 python -m pip install -r requirements-local-api.txt
 ```
 
+如果你之後真的要改成 **qwen-cloud**：
+
+```bash
+python -m pip install -r requirements-qwen-cloud.txt
+```
+
 這會安裝：
 - autoCut 啟動所需的基礎套件
 - `sentrysearch` editable package
-- `local-api` 模式需要的依賴
+- 對應 backend 模式需要的依賴
 
 #### 手動安裝方式
 
@@ -82,11 +88,34 @@ python -m pip install -r requirements.txt
 python -m pip install -e "./sentrysearch[local-api]"
 ```
 
+若你要改用 qwen-cloud：
+
+```bash
+python -m pip install -e "./sentrysearch[qwen-cloud]"
+```
+
 安裝完成後可先確認：
 
 ```bash
 ./.venv/bin/python autocut.py --help
 ./.venv/bin/python autocut.py autocut --help
+```
+
+### 3. 環境設定
+
+複製範例檔並填寫你的設定：
+
+```bash
+cp .env.example .env
+# 編輯 .env，填入你的服務位址與模型名稱
+```
+
+你目前提供的服務對應的設定：
+
+```bash
+AUTOCUT_BACKEND=local-api
+LOCAL_API_BASE=http://192.168.0.207:8080
+LOCAL_API_MODEL=ggml-org_Qwen2.5-VL-7B-Instruct-GGUF_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
 ```
 
 ## 基本使用
@@ -97,7 +126,6 @@ python -m pip install -e "./sentrysearch[local-api]"
 ./.venv/bin/python autocut.py autocut ./chain_trip/LRV_20260415_155421_01_001.lrv \
   --prompt "first-person perspective or over-the-shoulder user viewpoint moments" \
   --count 3 \
-  --api-base-url http://192.168.0.207:8080 \
   -o ./autocut_preview.mp4
 ```
 
@@ -113,7 +141,6 @@ python -m pip install -e "./sentrysearch[local-api]"
   --hq-dir ./chain_trip_hq \
   --prompt "first-person perspective or over-the-shoulder user viewpoint moments" \
   --count 3 \
-  --api-base-url http://192.168.0.207:8080 \
   -o ./autocut_hq.mp4
 ```
 
@@ -166,15 +193,16 @@ python -m pip install -e "./sentrysearch[local-api]"
   - autoCut root venv 的基礎安裝需求
   - 包含 pip 常用建置工具與最基本啟動依賴
 - `requirements-local-api.txt`
-  - 建議日常使用的安裝方式
+  - 建議使用自架 llama.cpp / llmcpp / OpenAI 相容 HTTP API 的工作流使用
   - 會直接安裝 `./sentrysearch[local-api]`
-
-如果之後你要支援其他模式（例如 `local`、`qwen-cloud`），可以照同樣模式再拆出新的 requirements 檔。
+- `requirements-qwen-cloud.txt`
+  - 只有真的要走 qwen-cloud 時才需要
+  - 會直接安裝 `./sentrysearch[qwen-cloud]`
 
 ## 文件
 
 - 使用指南：[`docs/360-video-guide.zh.md`](./docs/360-video-guide.zh.md)
-- 上游專案：[`sentrysearch/README.md`](./sentrysearch/README.md)
+- fork 上游：[ssrajadh/sentrysearch](https://github.com/ssrajadh/sentrysearch)（本專案內的 `sentrysearch/` 為本地獨立 fork）
 - 開發說明：[`docs/development.zh.md`](./docs/development.zh.md)
 
 ## 注意事項

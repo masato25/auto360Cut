@@ -1,0 +1,6 @@
+# Recommended install for autoCut when using the qwen-cloud backend.
+#
+# This pulls in the editable sentrysearch package plus the DashScope SDK
+# required by sentrysearch.qwen_cloud_embedder.
+-r requirements.txt
+-e ./sentrysearch[qwen-cloud]
