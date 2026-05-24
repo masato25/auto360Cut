@@ -1,0 +1,17 @@
+__pycache__/
+.env
+.claude/
+
+test_footage/
+sentrysearch.egg-info/
+clips_output/
+
+notebooks/
+
+# Testing
+.pytest_cache/
+htmlcov/
+coverage.xml
+.coverage
+
+CLAUDE.md
