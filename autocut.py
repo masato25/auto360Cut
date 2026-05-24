@@ -125,6 +125,9 @@ def cli() -> None:
               help="Directory containing matching HQ source files (auto-mapped by timestamp).")
 @click.option("--360/--no-360", "is_360", default=None,
               help="Treat video as 360-degree video. Auto-detected when omitted.")
+@click.option("--face", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Reference face photo. Focus on clips containing this person.")
 @click.option("--force-reindex", is_flag=True,
               help="Re-index this video so changed viewport prompts take effect.")
 @click.option("--verbose", is_flag=True, help="Show debug info.")
@@ -142,6 +145,7 @@ def autocut_command(
     hq_source: Path | None,
     hq_dir: Path | None,
     is_360: bool | None,
+    face: Path | None,
     force_reindex: bool,
     verbose: bool,
 ) -> None:
@@ -199,6 +203,38 @@ def autocut_command(
         quantize=quantize,
         verbose=verbose,
     )
+
+    if face is not None:
+        click.echo(f"Re-ranking by face similarity: {face}", err=True)
+        try:
+            from sentrysearch.face_utils import encode_reference_face, face_similarity, deserialize_encodings
+            import json
+            ref_enc = encode_reference_face(str(face.resolve()))
+            if ref_enc is None:
+                click.echo("  No face detected in reference image.", err=True)
+            else:
+                scored: list[tuple[dict, float]] = []
+                for s in selected:
+                    raw = s.get("face_encodings", "")
+                    if not raw:
+                        scored.append((s, 0.0))
+                        continue
+                    try:
+                        stored = deserialize_encodings(json.loads(raw))
+                    except Exception:
+                        scored.append((s, 0.0))
+                        continue
+                    best_score = max((face_similarity(ref_enc, stored_f) for stored_f in stored), default=0.0)
+                    scored.append((s, best_score))
+                scored.sort(key=lambda x: x[1], reverse=True)
+                selected = [s for s, _ in scored]
+                click.echo(f"  Face re-ranking applied (best score: {scored[0][1]:.3f})", err=True)
+                for s, score in scored:
+                    click.echo(f"    face_score={score:.3f}  [{_fmt_time(s['start_time'])}-{_fmt_time(s['end_time'])}] {s.get('caption', '')[:60]}", err=True)
+        except ImportError as exc:
+            click.echo(f"  face_recognition not available: {exc}", err=True)
+            click.echo("  Install: pip install face_recognition", err=True)
+
     _render_autocut(
         selected,
         source_video=video_path,
@@ -356,6 +392,12 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
         else:
             meta = {}
             vec = embedder.embed_video_chunk(chunk["chunk_path"], metadata=meta, verbose=verbose)
+            # face detection for non-360 chunks
+            if not is_360:
+                faces = _detect_faces_in_viewport(chunk["chunk_path"], verbose)
+                if faces:
+                    import json
+                    meta["face_encodings"] = json.dumps(faces)
         if vec is None:
             continue
 
@@ -372,6 +414,9 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
             "viewport_index_version": meta.get("viewport_index_version", 0),
             "viewport_captions": meta.get("viewport_captions", ""),
         }
+        face_enc = meta.get("face_encodings")
+        if face_enc:
+            chunk_meta["face_encodings"] = face_enc
         store.add_chunk(chunk_id, vec, chunk_meta)
         new_chunks += 1
         try:
@@ -396,12 +441,32 @@ def _is_360_cache_current(meta: dict, viewport_prompt: str, projection: str | No
     )
 
 
+def _detect_faces_in_viewport(viewport_path: str, verbose: bool) -> list[list[float]]:
+    encodings: list[list[float]] = []
+    try:
+        from sentrysearch.face_utils import extract_frame, encode_face_array
+        frame = extract_frame(viewport_path, time_sec=0.0)
+        if frame is not None:
+            face_vecs = encode_face_array(frame)
+            if face_vecs and verbose:
+                click.echo(f"    [face] detected {len(face_vecs)} face(s)", err=True)
+            encodings = [v.tolist() for v in face_vecs]
+    except Exception:
+        if verbose:
+            click.echo("    [face] detection skipped", err=True)
+    return encodings
+
+
+_face_recording_available = True
+
+
 def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
                      viewport_prompt: str, verbose: bool) -> tuple[list[float] | None, dict]:
     """Embed a 360 chunk by captioning four flat viewports and selecting best yaw."""
     captions_by_view: dict[str, str] = {}
     tmp_paths: list[str] = []
     vectors: dict[str, list[float]] = {}
+    face_encodings_by_view: dict[str, list[list[float]]] = {}
     try:
         for view, yaw in VIEW_TO_YAW.items():
             fd, viewport_path = tempfile.mkstemp(suffix=f"_{view}.mp4")
@@ -416,6 +481,9 @@ def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
                 vectors[view] = vec
             if verbose:
                 click.echo(f"    [360] {view} yaw={yaw}: {caption[:90]}", err=True)
+            faces = _detect_faces_in_viewport(viewport_path, verbose)
+            if faces:
+                face_encodings_by_view[view] = faces
 
         best_view = _choose_best_360_view(embedder, captions_by_view, viewport_prompt, verbose)
         best_vec = vectors.get(best_view)
@@ -432,6 +500,9 @@ def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
             f"{view}: {caption}" for view, caption in captions_by_view.items() if caption
         )
         best_caption = captions_by_view.get(best_view, "")
+        all_faces: list[list[float]] = []
+        for view in VIEW_CHOICES:
+            all_faces.extend(face_encodings_by_view.get(view, []))
         meta = {
             "caption": best_caption or combined_caption,
             "is_360": True,
@@ -442,6 +513,9 @@ def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
             "viewport_index_version": VIEWPORT_INDEX_VERSION,
             "viewport_captions": combined_caption,
         }
+        if all_faces:
+            import json
+            meta["face_encodings"] = json.dumps(all_faces)
         return best_vec, meta
     finally:
         for path in tmp_paths:

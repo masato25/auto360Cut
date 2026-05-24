@@ -35,6 +35,7 @@ class AutocutGUI(tk.Tk):
         self.backend = tk.StringVar(value="local-api")
         self.is_360 = tk.BooleanVar(value=False)
         self.output_path = tk.StringVar()
+        self.face_path = tk.StringVar()
         self.verbose = tk.BooleanVar(value=False)
 
     def _build_ui(self):
@@ -69,6 +70,15 @@ class AutocutGUI(tk.Tk):
                      state="readonly", width=12).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
         ttk.Checkbutton(opts, text="360 模式", variable=self.is_360).grid(row=0, column=4, sticky=tk.W)
         ttk.Checkbutton(opts, text="詳細日誌", variable=self.verbose).grid(row=0, column=5, sticky=tk.W, padx=(10, 0))
+
+        # face reference
+        row2 = ttk.Frame(main)
+        row2.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(row2, text="參考臉部照片 (選填)", font=("", 11, "bold")).pack(anchor=tk.W)
+        frow2 = ttk.Frame(row2)
+        frow2.pack(fill=tk.X, pady=(4, 0))
+        ttk.Entry(frow2, textvariable=self.face_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(frow2, text="選擇…", command=self._browse_face).pack(side=tk.RIGHT, padx=(6, 0))
 
         # output
         row3 = ttk.Frame(main)
@@ -106,6 +116,14 @@ class AutocutGUI(tk.Tk):
         )
         if f:
             self._set_video(f)
+
+    def _browse_face(self):
+        f = filedialog.askopenfilename(
+            title="選擇參考臉部照片",
+            filetypes=[("圖片", "*.jpg *.jpeg *.png *.webp"), ("所有檔案", "*.*")]
+        )
+        if f:
+            self.face_path.set(f)
 
     def _browse_output(self):
         f = filedialog.asksaveasfilename(
@@ -158,6 +176,9 @@ class AutocutGUI(tk.Tk):
             "--backend", self.backend.get(),
             "-o", output,
         ]
+        face = self.face_path.get().strip()
+        if face and os.path.isfile(face):
+            args.extend(["--face", face])
         if self.is_360.get():
             args.append("--360")
         if self.verbose.get():

@@ -11,13 +11,21 @@ autoCut 是一個用來把 360 / 一般影片做「語意搜尋」與「自動�
 
 > 簡單說：先讓 AI 看得快，再讓成品輸出得好。
 
+## 人臉辨識（選用）
+
+```bash
+.venv/bin/python -m pip install face_recognition
+```
+
+索引時自動偵測各視角的人臉。搜尋時加 `--face ref.jpg` 就會把有該主角的片段排在前面。
+
 ## 圖形介面 (GUI)
 
 ```bash
 .venv/bin/python autocut_gui.py
 ```
 
-開啟後即可選擇影片、輸入 prompt、一鍵執行剪輯。需先安裝 tkinter：
+開啟後即可選擇影片、輸入 prompt、選擇參考臉部照片、一鍵執行剪輯。需先安裝 tkinter：
 ```bash
 brew install python-tk@3.14
 ```
