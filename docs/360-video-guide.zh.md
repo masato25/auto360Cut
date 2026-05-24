@@ -309,9 +309,74 @@ chunk_000.mp4
 
 ## 高畫質輸出工作流程
 
-目前 pipeline 設計是**索引用 LRV（低解析度代理），輸出用 HQ 來源**：
+目前 pipeline 建議採用 **proxy 索引、HQ 輸出**：索引時使用低解析度代理檔（LRV 或自行轉出的 proxy MP4）加快分析；最後剪輯與投影轉換則改從高畫質 360 MP4 來源輸出。
 
-### 方式 1：直接指定 HQ 檔案
+如果原始素材是 Insta360 `INSV`，最穩定的流程是：
+
+1. 先用 **Insta360 Studio** 把 `INSV` 匯出成高畫質 **equirectangular / 360 MP4**，作為 HQ master。
+2. 從這支 HQ MP4 另外產生一支低解析度 proxy MP4（例如 960px 高、5fps）。
+3. 用 proxy MP4 建索引與選片。
+4. 透過 `--hq-source` 或 `--hq-dir` 指向 HQ master，讓最終輸出使用高畫質來源。
+
+> 為什麼不直接索引 HQ？可以，但慢很多、吃儲存與模型處理時間。proxy 只影響搜尋與選片速度；實際輸出仍從 HQ master 裁切，所以畫質不會被 proxy 限制。
+
+### 從 HQ 360 MP4 產生 proxy MP4
+
+假設 Studio 匯出的高畫質檔是：
+
+```bash
+./hq/VID_20260415_155421_00_001.mp4
+```
+
+可用 ffmpeg 產生低解析度代理檔：
+
+```bash
+mkdir -p ./proxy
+ffmpeg -i ./hq/VID_20260415_155421_00_001.mp4 \
+  -vf "scale=-2:960,fps=5" \
+  -c:v libx264 -preset veryfast -crf 28 \
+  -pix_fmt yuv420p -an \
+  ./proxy/VID_20260415_155421_00_001.proxy.mp4
+```
+
+建議：
+
+- `scale=-2:960`：維持原始 2:1 equirectangular 比例，只把高度降到 960px；若機器較慢可改 `720`。
+- `fps=5`：索引用低幀率即可，大幅降低處理量。
+- `-an`：索引不需要音訊，proxy 可移除音軌。
+- proxy 仍必須是 **equirectangular / 360 2:1**，不要輸出成 reframed 平面影片。
+
+### 方式 1：proxy 索引 + 直接指定 HQ 檔案
+
+```bash
+./.venv/bin/python autocut.py autocut ./proxy/VID_20260415_155421_00_001.proxy.mp4 \
+  --prompt "first-person perspective or over-the-shoulder user viewpoint moments" \
+  --count 3 \
+  --hq-source ./hq/VID_20260415_155421_00_001.mp4 \
+  -o ~/Desktop/output_hq.mp4
+```
+
+這是最明確、最不容易配錯檔案的方式：`VIDEO` 參數負責索引與搜尋，`--hq-source` 負責最終裁切輸出。
+
+### 方式 2：proxy 索引 + `--hq-dir` 自動對應
+
+若 proxy 檔名保留同一組 timestamp / 序號，也可以把 HQ master 放在同一個目錄或指定的 HQ 目錄，讓 autocut 自動尋找：
+
+```bash
+./.venv/bin/python autocut.py autocut ./proxy/VID_20260415_155421_00_001.proxy.mp4 \
+  --prompt "first-person perspective or over-the-shoulder user viewpoint moments" \
+  --count 3 \
+  --hq-dir ./hq \
+  -o ~/Desktop/output_hq.mp4
+```
+
+若自動配對失敗，改用 `--hq-source` 直接指定 HQ master。
+
+### 舊流程：LRV 索引 + HQ 輸出
+
+若相機已提供 `.lrv`，也可沿用 **LRV 直接索引、HQ 輸出**：
+
+#### 方式 A：直接指定 HQ 檔案
 
 ```bash
 ./.venv/bin/python autocut.py autocut LRV_20260415_155421_01_001.lrv \
@@ -321,7 +386,7 @@ chunk_000.mp4
   -o ~/Desktop/output_hq.mp4
 ```
 
-### 方式 2：自動對應目錄
+#### 方式 B：自動對應目錄
 
 ```bash
 ./.venv/bin/python autocut.py autocut LRV_20260415_155421_01_001.lrv \
@@ -337,13 +402,6 @@ LRV_20260415_155421_01_001.lrv
   → 擷取 timestamp: 20260415_155421, seq: 001
   → 搜尋 VID_20260415_155421_00_001.mp4
 ```
-
-### Insta360 建議工作流程
-
-1. **LRV 直接索引**（快，不吃 GPU）
-2. 把對應的 **INSV 用 Insta360 Studio 匯出成 equirectangular MP4**
-3. 用 `--hq-dir` 指向匯出目錄，autocut 自動抓 HQ 來源
-4. 輸出即為高畫質 + 最佳視角
 
 ### 如何用 Insta360 Studio 輸出 360 檔案
 
