@@ -33,6 +33,8 @@ load_dotenv()
 DEFAULT_API_BASE = "http://localhost:8080"
 DEFAULT_MODEL = "default"
 DEFAULT_DIMENSIONS = 768
+DEFAULT_VISION_IMAGE_SIZE = 448
+DEFAULT_VISION_JPEG_QUALITY = 7
 VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
@@ -53,16 +55,24 @@ def _read_image_b64(path: str) -> str:
 
 
 def _extract_frame(video_path: str, seek_sec: float = 0.0) -> str | None:
-    """Extract a single JPEG frame from *video_path* at *seek_sec*."""
+    """Extract a small JPEG frame from *video_path* at *seek_sec*.
+
+    Local OpenAI-compatible vision servers often run with a 4096-token context.
+    Sending a full-resolution 360 frame can exceed that limit, so downscale the
+    still image before base64 encoding it for chat/completions.
+    """
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     tmp.close()
+    image_size = int(os.environ.get("LOCAL_API_VISION_IMAGE_SIZE", str(DEFAULT_VISION_IMAGE_SIZE)))
+    jpeg_quality = int(os.environ.get("LOCAL_API_VISION_JPEG_QUALITY", str(DEFAULT_VISION_JPEG_QUALITY)))
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y", "-ss", str(seek_sec),
                 "-i", video_path,
                 "-vframes", "1",
-                "-q:v", "2",
+                "-vf", f"scale='min({image_size},iw)':-2",
+                "-q:v", str(jpeg_quality),
                 tmp.name,
             ],
             capture_output=True, text=True,

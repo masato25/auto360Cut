@@ -247,17 +247,30 @@ chunk_000.mp4
 
 ### 流程
 
-1. **索引**：將影片切成 30 秒 chunks，每個 chunk 抽一幀送 Qwen2.5-VL 產生描述，再透過 API `/v1/embeddings` 轉成向量存入 ChromaDB
+1. **索引**：將影片切成 30 秒 chunks；360 chunk 會先轉成 `front/right/back/left` 四個平面視角，分別送 Qwen2.5-VL 產生 caption 與 embedding，再把最佳視角 metadata 存入 ChromaDB
 2. **選取**：將 prompt 轉成向量，在 ChromaDB 做語意搜尋，選出最相關的 clips
-3. **轉換**：將選中的 clips 從最佳視角或 `--view` / `--yaw` 指定視角輸出成平面影片；若 trim 來源是 Studio 匯出的 HQ equirect MP4，會重新偵測投影格式，避免沿用 LRV 的 `dfisheye` 設定造成拉伸
-4. **拼接**：所有 clip 串接成一支影片
+3. **自動視角**：索引階段也會把 prompt 與四個視角 caption 做 embedding 相似度比對，寫入 `best_direction` / `best_yaw`；`--view auto` 會使用這個結果
+4. **轉換**：將選中的 clips 從最佳視角或 `--view` / `--yaw` 指定視角輸出成平面影片；若 trim 來源是 Studio 匯出的 HQ equirect MP4，會重新偵測投影格式，避免沿用 LRV 的 `dfisheye` 設定造成拉伸
+5. **拼接**：所有 clip 串接成一支影片
 
 ### 參數分工
 
-- `--prompt`：控制選哪些片段
-- `--force-reindex`：重建既有 chunk 的索引
-- `--view`：最終輸出時強制使用 `front/right/back/left`
+- `--prompt`：控制選哪些片段，也控制 360 自動視角要偏向哪種畫面；同一段 chunk 可能因 prompt 不同而選到不同 `best_direction`
+- `--force-reindex`：重建既有 chunk 的索引；若 cached caption 為空、視角索引版本過期、projection 改變，或 360 索引使用的 prompt 不同，autoCut 也會自動重建該 chunk
+- `--view`：最終輸出時強制使用 `front/right/back/left`；預設 `auto` 使用索引 metadata 的最佳視角
 - `--yaw`：最終輸出時直接指定角度，優先權高於 `--view`
+
+### 360 自動視角 metadata
+
+每個 360 chunk 會保存下列資訊，方便後續輸出與除錯：
+
+| 欄位 | 說明 |
+|------|------|
+| `best_direction` | `front` / `right` / `back` / `left`，prompt 比對後選出的方向 |
+| `best_yaw` | 對應 yaw 角度，輸出時會正規化到 ffmpeg v360 可用範圍 |
+| `viewport_prompt` | 建立此視角索引時使用的 prompt |
+| `viewport_captions` | 四個視角 caption 的合併摘要 |
+| `viewport_index_version` | 視角索引策略版本，用於判斷 cache 是否仍有效 |
 
 ### HQ 工作流建議
 
@@ -284,7 +297,7 @@ chunk_000.mp4
 | 參數 | 說明 |
 |------|------|
 | `VIDEO` | 要處理的影片路徑 |
-| `-p, --prompt` | 描述想選取的片段內容（預設：`first-person perspective or over-the-shoulder user viewpoint moments`） |
+| `-p, --prompt` | 描述想選取的片段內容，也會用來選 360 自動視角（預設：`first-person perspective or over-the-shoulder user viewpoint moments`） |
 | `-n, --count` | 選取片段數量（預設 3） |
 | `-o, --output` | 輸出影片路徑（預設 `autocut_output.mp4`） |
 | `--backend` | 選擇 backend：`local-api`（預設）、`local`、`qwen-cloud`、`gemini` |

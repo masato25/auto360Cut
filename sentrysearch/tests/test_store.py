@@ -190,6 +190,17 @@ class TestStoreBackend:
         assert "/" not in suffix and ":" not in suffix and "@" not in suffix
         assert all(c.isalnum() or c in "._-" for c in suffix)
 
+    def test_local_api_collection_keyed_by_embedding_model(self, tmp_path, monkeypatch):
+        from sentrysearch.store import SentryStore
+
+        monkeypatch.setenv("LOCAL_API_EMBEDDINGS_MODEL", "text-embed/model:v1")
+        store_a = SentryStore(db_path=tmp_path / "db", backend="local-api", model="vision-a")
+        store_b = SentryStore(db_path=tmp_path / "db", backend="local-api", model="vision-b")
+
+        assert store_a.collection.name == "dashcam_chunks_local_api_text-embed_model_v1"
+        assert store_a.collection.name == store_b.collection.name
+        assert store_a.get_model() == "text-embed/model:v1"
+
     def test_backends_use_separate_collections(self, tmp_path):
         from sentrysearch.store import SentryStore
 
@@ -294,6 +305,16 @@ class TestDetectIndex:
             "source_file": "v.mp4", "start_time": 0.0, "end_time": 30.0,
         })
         assert detect_index(tmp_path / "db") == ("local", "qwen2b")
+
+    def test_detects_local_api_before_local_prefix(self, tmp_path, monkeypatch):
+        from sentrysearch.store import SentryStore, detect_index
+
+        monkeypatch.setenv("LOCAL_API_EMBEDDINGS_MODEL", "embed-v1")
+        store = SentryStore(db_path=tmp_path / "db", backend="local-api", model="vision-v1")
+        store.add_chunk("c1", _make_embedding(), {
+            "source_file": "v.mp4", "start_time": 0.0, "end_time": 30.0,
+        })
+        assert detect_index(tmp_path / "db") == ("local-api", "embed-v1")
 
     def test_legacy_local_treated_as_qwen8b(self, tmp_path):
         from sentrysearch.store import SentryStore, detect_index

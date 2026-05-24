@@ -33,7 +33,15 @@ def _collection_name(backend: str, model: str | None = None) -> str:
         slug = _chroma_collection_slug(model or "qwen3-vl-embedding")
         return f"dashcam_chunks_qwen_cloud_{slug}"
     if backend == "local-api":
-        slug = _chroma_collection_slug(model or "default")
+        # The local-api backend can use one vision/chat model for captioning and
+        # a separate embeddings model for vectors.  Keep all entries that share
+        # the same vector model in one collection so runs that rely on env-based
+        # model defaults can still read rows indexed by an explicit/implicit
+        # caption model name.
+        import os
+
+        embedding_model = os.environ.get("LOCAL_API_EMBEDDINGS_MODEL") or "default"
+        slug = _chroma_collection_slug(embedding_model)
         return f"dashcam_chunks_local_api_{slug}"
     if model:
         return f"dashcam_chunks_local_{model}"
@@ -72,9 +80,21 @@ def detect_index(db_path: str | Path | None = None) -> tuple[str | None, str | N
                     model = name.removeprefix("dashcam_chunks_qwen_cloud_")
                 return "qwen-cloud", model
 
+    # OpenAI-compatible local API collections.  Check before local because the
+    # local-api prefix also starts with dashcam_chunks_local_.
+    for name in sorted(existing):
+        if name.startswith("dashcam_chunks_local_api_"):
+            col = client.get_collection(name)
+            if col.count() > 0:
+                meta = col.metadata or {}
+                model = meta.get("embedding_model")
+                if model is None:
+                    model = name.removeprefix("dashcam_chunks_local_api_")
+                return "local-api", model
+
     # Model-specific local collections (dashcam_chunks_local_<model>)
     for name in sorted(existing):
-        if name.startswith("dashcam_chunks_local_"):
+        if name.startswith("dashcam_chunks_local_") and not name.startswith("dashcam_chunks_local_api_"):
             col = client.get_collection(name)
             if col.count() > 0:
                 meta = col.metadata or {}
@@ -118,7 +138,13 @@ class SentryStore:
         # Separate collection per backend+model so incompatible vectors never mix.
         col_name = _collection_name(backend, model)
         metadata = {"hnsw:space": "cosine", "embedding_backend": backend}
-        if model:
+        if backend == "local-api":
+            import os
+
+            metadata["embedding_model"] = os.environ.get("LOCAL_API_EMBEDDINGS_MODEL") or "default"
+            if model:
+                metadata["caption_model"] = model
+        elif model:
             metadata["embedding_model"] = model
         self._collection = self._client.get_or_create_collection(
             name=col_name,

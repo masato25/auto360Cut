@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import click
@@ -64,13 +65,21 @@ def convert_clip_to_flat(*args, **kwargs):
             "360 viewport conversion is unavailable in the current sentrysearch version: "
             "missing sentrysearch.v360_utils"
         ) from exc
+    if "yaw" in kwargs and kwargs["yaw"] is not None:
+        kwargs["yaw"] = _normalize_v360_yaw(float(kwargs["yaw"]))
     return _convert_clip_to_flat(*args, **kwargs)
+
+
+def _normalize_v360_yaw(yaw: float) -> float:
+    """Normalize user-facing 0..360 yaw into ffmpeg v360's -180..180 range."""
+    return ((yaw + 180.0) % 360.0) - 180.0
 
 DEFAULT_PROMPT = (
     "first-person perspective or over-the-shoulder user viewpoint moments"
 )
 VIEW_CHOICES = ["auto", "front", "right", "back", "left"]
 VIEW_TO_YAW = {"front": 0, "right": 90, "back": 180, "left": 270}
+VIEWPORT_INDEX_VERSION = 2
 DEFAULT_BACKEND = os.environ.get("AUTOCUT_BACKEND", "local-api")
 DEFAULT_LOCAL_MODEL = os.environ.get("AUTOCUT_LOCAL_MODEL", "qwen8b")
 
@@ -164,13 +173,21 @@ def autocut_command(
         quantize=quantize,
         is_360=bool(is_360),
         projection=projection,
+        viewport_prompt=prompt,
         force_reindex=force_reindex,
         verbose=verbose,
     )
 
     rows = _load_rows(video_path, backend=backend, model=resolved_model)
     if not rows:
-        click.echo("No captions found for this video. Indexing may have failed.")
+        click.echo(
+            "No captions found for this video after indexing. "
+            "The vision/caption API likely returned empty captions.\n"
+            "Try again with --verbose to see the local-api error, and verify your "
+            "OpenAI-compatible vision server is running and supports image_url chat "
+            "messages. If the cached chunks were stale, rerun with --force-reindex.",
+            err=True,
+        )
         raise SystemExit(1)
 
     selected = _select_clips(
@@ -269,7 +286,7 @@ def _resolve_model(backend: str, model: str | None, dashscope_model: str | None)
 
 def _index_video(*, video_path: str, backend: str, model: str | None,
                  quantize: bool | None, is_360: bool,
-                 projection: str | None,
+                 projection: str | None, viewport_prompt: str,
                  force_reindex: bool, verbose: bool) -> None:
     from sentrysearch.chunker import chunk_video
 
@@ -303,19 +320,42 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
 
     chunks = chunk_video(video_path, chunk_duration=30, overlap=5)
     new_chunks = 0
+    rebuilt_chunks = 0
+    skipped_chunks = 0
     for chunk in chunks:
         chunk_id = store.make_chunk_id(video_path, chunk["start_time"])
-        if store.has_chunk(chunk_id):
-            if is_360 and not force_reindex:
-                click.echo(
-                    f"Skipping existing chunk @ {_fmt_time(chunk['start_time'])}; use --force-reindex to rebuild cached chunks.",
-                    err=True,
-                )
-            continue
+        existing_meta = _get_chunk_metadata(store, chunk_id)
+        if existing_meta is not None:
+            existing_caption = (existing_meta.get("caption") or "").strip()
+            rebuild_reason = ""
+            if not existing_caption:
+                rebuild_reason = "cached caption is empty"
+            elif is_360 and not _is_360_cache_current(existing_meta, viewport_prompt, projection):
+                rebuild_reason = "360 viewport prompt/index settings changed"
+
+            if not rebuild_reason:
+                skipped_chunks += 1
+                continue
+
+            click.echo(
+                f"  Rebuilding chunk @ {_fmt_time(chunk['start_time'])}: {rebuild_reason}.",
+                err=True,
+            )
+            store.collection.delete(ids=[chunk_id])
+            rebuilt_chunks += 1
 
         click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
-        meta: dict = {}
-        vec = embedder.embed_video_chunk(chunk["chunk_path"], metadata=meta, verbose=verbose)
+        if is_360:
+            vec, meta = _embed_360_chunk(
+                embedder=embedder,
+                chunk_path=chunk["chunk_path"],
+                projection=projection or "equirect",
+                viewport_prompt=viewport_prompt,
+                verbose=verbose,
+            )
+        else:
+            meta = {}
+            vec = embedder.embed_video_chunk(chunk["chunk_path"], metadata=meta, verbose=verbose)
         if vec is None:
             continue
 
@@ -328,6 +368,9 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
             "best_yaw": meta.get("best_yaw", 0),
             "best_direction": meta.get("best_direction", ""),
             "projection": projection or meta.get("projection", "equirect"),
+            "viewport_prompt": meta.get("viewport_prompt", ""),
+            "viewport_index_version": meta.get("viewport_index_version", 0),
+            "viewport_captions": meta.get("viewport_captions", ""),
         }
         store.add_chunk(chunk_id, vec, chunk_meta)
         new_chunks += 1
@@ -338,31 +381,153 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
 
     if chunks:
         shutil.rmtree(os.path.dirname(chunks[0]["chunk_path"]), ignore_errors=True)
-    click.echo(f"Indexed {new_chunks} new chunk(s).")
+    click.echo(
+        f"Indexed {new_chunks} chunk(s): {rebuilt_chunks} rebuilt, {skipped_chunks} already valid."
+    )
+
+
+def _is_360_cache_current(meta: dict, viewport_prompt: str, projection: str | None) -> bool:
+    return (
+        meta.get("viewport_index_version") == VIEWPORT_INDEX_VERSION
+        and meta.get("viewport_prompt") == viewport_prompt
+        and bool(meta.get("best_direction"))
+        and meta.get("projection", "equirect") == (projection or "equirect")
+        and bool((meta.get("viewport_captions") or "").strip())
+    )
+
+
+def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
+                     viewport_prompt: str, verbose: bool) -> tuple[list[float] | None, dict]:
+    """Embed a 360 chunk by captioning four flat viewports and selecting best yaw."""
+    captions_by_view: dict[str, str] = {}
+    tmp_paths: list[str] = []
+    vectors: dict[str, list[float]] = {}
+    try:
+        for view, yaw in VIEW_TO_YAW.items():
+            fd, viewport_path = tempfile.mkstemp(suffix=f"_{view}.mp4")
+            os.close(fd)
+            tmp_paths.append(viewport_path)
+            convert_clip_to_flat(chunk_path, viewport_path, yaw=yaw, projection=projection)
+            view_meta: dict = {}
+            vec = embedder.embed_video_chunk(viewport_path, metadata=view_meta, verbose=verbose)
+            caption = (view_meta.get("caption") or "").strip()
+            captions_by_view[view] = caption
+            if vec is not None:
+                vectors[view] = vec
+            if verbose:
+                click.echo(f"    [360] {view} yaw={yaw}: {caption[:90]}", err=True)
+
+        best_view = _choose_best_360_view(embedder, captions_by_view, viewport_prompt, verbose)
+        best_vec = vectors.get(best_view)
+        if best_vec is None:
+            for view in VIEW_CHOICES:
+                if view in vectors:
+                    best_view = view
+                    best_vec = vectors[view]
+                    break
+        if best_vec is None:
+            return None, {}
+
+        combined_caption = "; ".join(
+            f"{view}: {caption}" for view, caption in captions_by_view.items() if caption
+        )
+        best_caption = captions_by_view.get(best_view, "")
+        meta = {
+            "caption": best_caption or combined_caption,
+            "is_360": True,
+            "best_yaw": VIEW_TO_YAW[best_view],
+            "best_direction": best_view,
+            "projection": projection,
+            "viewport_prompt": viewport_prompt,
+            "viewport_index_version": VIEWPORT_INDEX_VERSION,
+            "viewport_captions": combined_caption,
+        }
+        return best_vec, meta
+    finally:
+        for path in tmp_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _choose_best_360_view(embedder, captions_by_view: dict[str, str], prompt: str, verbose: bool) -> str:
+    query_vec = embedder.embed_query(prompt, verbose=verbose)
+    best_view = "front"
+    best_score = float("-inf")
+    for view, caption in captions_by_view.items():
+        if not caption:
+            continue
+        caption_vec = embedder.embed_query(caption, verbose=False)
+        score = _cosine_similarity(query_vec, caption_vec)
+        if verbose:
+            click.echo(f"    [360] match {view}: {score:.4f}", err=True)
+        if score > best_score:
+            best_score = score
+            best_view = view
+    return best_view
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    denom_a = sum(x * x for x in a) ** 0.5
+    denom_b = sum(x * x for x in b) ** 0.5
+    if denom_a == 0 or denom_b == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (denom_a * denom_b)
+
+
+def _get_chunk_metadata(store: SentryStore, chunk_id: str) -> dict | None:
+    results = store.collection.get(ids=[chunk_id], include=["metadatas"])
+    ids = results.get("ids") or []
+    if not ids:
+        return None
+    metadatas = results.get("metadatas") or []
+    if not metadatas:
+        return {}
+    return metadatas[0] or {}
 
 
 def _load_rows(video_path: str, *, backend: str, model: str | None) -> list[dict]:
     store = SentryStore(backend=backend, model=model)
-    all_data = store.collection.get(include=["metadatas"])
+    collections = [store.collection]
+
+    # Compatibility: older local-api indexes used the vision/caption model name
+    # in the collection name.  Current local-api collections are keyed by the
+    # embeddings model, but autocut still needs to read rows that were just
+    # indexed by a previous version or by an explicit --model run.
+    if backend == "local-api":
+        seen_names = {store.collection.name}
+        for col in store._client.list_collections():  # noqa: SLF001 - compatibility scan
+            if col.name.startswith("dashcam_chunks_local_api_") and col.name not in seen_names:
+                collections.append(store._client.get_collection(col.name))  # noqa: SLF001
+                seen_names.add(col.name)
+
     rows: list[dict] = []
-    for i, _cid in enumerate(all_data.get("ids", [])):
-        meta = all_data["metadatas"][i]
-        if meta.get("source_file") != video_path:
-            continue
-        caption = meta.get("caption", "")
-        if not caption:
-            continue
-        rows.append({
-            "idx": i,
-            "source_file": meta["source_file"],
-            "start_time": float(meta["start_time"]),
-            "end_time": float(meta["end_time"]),
-            "caption": caption,
-            "is_360": meta.get("is_360", False),
-            "best_yaw": meta.get("best_yaw", 0),
-            "best_direction": meta.get("best_direction", ""),
-            "projection": meta.get("projection", "equirect"),
-        })
+    seen_ranges: set[tuple[float, float, str]] = set()
+    for collection in collections:
+        all_data = collection.get(include=["metadatas"])
+        for i, _cid in enumerate(all_data.get("ids", [])):
+            meta = all_data["metadatas"][i]
+            if meta.get("source_file") != video_path:
+                continue
+            caption = meta.get("caption", "")
+            if not caption:
+                continue
+            key = (float(meta["start_time"]), float(meta["end_time"]), meta["source_file"])
+            if key in seen_ranges:
+                continue
+            seen_ranges.add(key)
+            rows.append({
+                "idx": i,
+                "source_file": meta["source_file"],
+                "start_time": key[0],
+                "end_time": key[1],
+                "caption": caption,
+                "is_360": meta.get("is_360", False),
+                "best_yaw": meta.get("best_yaw", 0),
+                "best_direction": meta.get("best_direction", ""),
+                "projection": meta.get("projection", "equirect"),
+            })
     rows.sort(key=lambda r: r["start_time"])
     return rows
 
