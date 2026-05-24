@@ -135,10 +135,14 @@ curl http://192.168.0.207:8080/v1/chat/completions \
 ## 安裝與環境
 
 ```bash
-# 建立虛擬環境（需要 Python 3.11-3.12）
-python3.12 -m venv .venv
+# 建立虛擬環境（需要 Python 3.11-3.14）
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+
+# macOS 3.14 expat 問題：先執行以下指令再繼續
+# brew install expat
+# export DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/expat/2.8.1/lib
 
 # 安裝 autoCut 依賴（含 local-api backend）
 python -m pip install -r requirements-local-api.txt

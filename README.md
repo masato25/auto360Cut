@@ -47,76 +47,86 @@ Insta360 原始素材
 
 ## 安裝
 
-### 1. 建立 virtual environment
-
-建議使用 Python 3.11 或 3.12。
+### 快速安裝（自動腳本）
 
 ```bash
-cd /Users/geassbot/Movies/autoCut
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+bash scripts/install.sh
 ```
 
-### 2. 安裝依賴
+腳本會自動：
+1. 檢查 Python 版本（需 3.11–3.14）
+2. 偵測並修復 macOS Python 3.14 的 `libexpat` 問題
+3. 建立 virtual environment（`.venv`）
+4. 讓你選擇 backend 並安裝對應依賴
+5. 從 `.env.example` 建立 `.env`
 
-#### 建議方式：使用已整理好的 requirements
+### 手動安裝
 
-如果你是像目前這個專案實際使用方式一樣，接 **自己本地啟動的 llama.cpp / OpenAI 相容 HTTP 服務**（例如 `http://192.168.0.207:8080`，模型為 `ggml-org_Qwen2.5-VL-7B-Instruct-GGUF_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf`），建議優先使用：
+#### 系統需求
 
-```bash
-python -m pip install -r requirements-local-api.txt
-```
+- **Python 3.11 – 3.14**
+- **ffmpeg**（系統安裝或由 `imageio-ffmpeg` 自動處理）
+- **macOS + Python 3.14**：需先安裝 Homebrew expat（見下方疑難排解）
 
-如果你之後真的要改成 **qwen-cloud**：
-
-```bash
-python -m pip install -r requirements-qwen-cloud.txt
-```
-
-這會安裝：
-- autoCut 啟動所需的基礎套件
-- `sentrysearch` editable package
-- 對應 backend 模式需要的依賴
-
-#### 手動安裝方式
-
-如果你想分開安裝，也可以：
+#### 步驟
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip install -e "./sentrysearch[local-api]"
-```
+# 1. 建立 virtual environment（macOS 3.14 請見下方注意）
+python3 -m venv .venv
 
-若你要改用 qwen-cloud：
+# 2. 升級 pip
+.venv/bin/python -m pip install --upgrade pip
 
-```bash
-python -m pip install -e "./sentrysearch[qwen-cloud]"
-```
+# 3. 安裝依賴（依你的 backend 選擇其一）
+.venv/bin/python -m pip install -r requirements-local-api.txt    # local-api（推薦）
+# .venv/bin/python -m pip install -r requirements-qwen-cloud.txt # qwen-cloud
+# .venv/bin/python -m pip install -e "./sentrysearch[local]"     # local GPU
 
-安裝完成後可先確認：
-
-```bash
-./.venv/bin/python autocut.py --help
-./.venv/bin/python autocut.py autocut --help
-```
-
-### 3. 環境設定
-
-複製範例檔並填寫你的設定：
-
-```bash
+# 4. 環境設定
 cp .env.example .env
-# 編輯 .env，填入你的服務位址與模型名稱
+# 編輯 .env 填入你的 API 設定
 ```
 
-你目前提供的服務對應的設定：
+#### 安裝確認
 
 ```bash
-AUTOCUT_BACKEND=local-api
-LOCAL_API_BASE=http://192.168.0.207:8080
-LOCAL_API_MODEL=ggml-org_Qwen2.5-VL-7B-Instruct-GGUF_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+.venv/bin/python autocut.py --help
+.venv/bin/python autocut.py autocut --help
 ```
+
+### macOS Python 3.14 疑難排解（expat）
+
+Homebrew 的 Python 3.14 依賴新版 `libexpat`，但 macOS 系統內建的是舊版，會導致 `pip install` 失敗：
+
+```
+ImportError: Symbol not found: _XML_SetAllocTrackerActivationThreshold
+```
+
+**解法：**
+
+```bash
+# 1. 安裝 Homebrew 的 expat
+brew install expat
+
+# 2. 設定環境變數後再操作 Python
+export DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/expat/2.8.1/lib
+
+# 3. 建立 venv（必須在有 DYLD_LIBRARY_PATH 的環境下）
+python3 -m venv .venv
+
+# 4. [重要] 建立 expat 修復包裝器，以後就不用再設變數
+mv .venv/bin/python .venv/bin/python.real
+cat > .venv/bin/python << 'WRAPPER'
+#!/bin/bash
+export DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/expat/2.8.1/lib
+exec "${BASH_SOURCE[0]}.real" "$@"
+WRAPPER
+chmod +x .venv/bin/python
+```
+
+之後 `./.venv/bin/python` 會自動載入正確的 expat，不需額外設定。
+
+> 💡 `scripts/install.sh` 會自動處理以上所有步驟。
 
 ## 基本使用
 
@@ -217,6 +227,37 @@ LOCAL_API_MODEL=ggml-org_Qwen2.5-VL-7B-Instruct-GGUF_Qwen2.5-VL-7B-Instruct-Q4_K
 - 使用指南：[`docs/360-video-guide.zh.md`](./docs/360-video-guide.zh.md)
 - fork 上游：[ssrajadh/sentrysearch](https://github.com/ssrajadh/sentrysearch)（本專案內的 `sentrysearch/` 為本地獨立 fork）
 - 開發說明：[`docs/development.zh.md`](./docs/development.zh.md)
+
+## 常見問題
+
+### `Symbol not found: _XML_SetAllocTrackerActivationThreshold`
+
+**原因**：macOS 的 Python 3.14（Homebrew）依賴新版 `libexpat`，但系統 `/usr/lib/libexpat.1.dylib` 是舊版。
+
+**解法**：
+```bash
+brew install expat
+export DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/expat/2.8.1/lib
+# 之後所有 Python 指令都需要在這個環境變數下執行
+# 或用 bash scripts/install.sh 自動處理
+```
+
+### `pip install` 出現 `externally-managed-environment`
+
+**原因**：Homebrew Python 不允許 pip 直接安裝系統套件。
+
+**解法**：使用 virtual environment（`.venv`），或在 pip 指令加 `--break-system-packages`。
+
+### `No module named 'encodings'` / `Could not find platform independent libraries`
+
+**原因**：virtual environment 建立時沒有正確設定 `DYLD_LIBRARY_PATH`（macOS 3.14 expat 問題）。
+
+**解法**：砍掉 `.venv`，在 `DYLD_LIBRARY_PATH` 有設定的環境下重新建立：
+```bash
+rm -rf .venv
+export DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/expat/2.8.1/lib
+python3 -m venv .venv
+```
 
 ## 注意事項
 

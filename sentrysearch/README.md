@@ -65,7 +65,7 @@ cd sentrysearch
 uv tool install .
 ```
 
-> **Requires Python 3.11 or 3.12** (PyTorch wheels don't yet support 3.13+). If your default Python is newer, install a managed 3.12 and pin the tool install:
+> **Requires Python 3.11 – 3.14**. If your default Python is newer, install a managed 3.12 and pin the tool install:
 > ```bash
 > uv python install 3.12
 > uv tool install --python 3.12 .
@@ -229,7 +229,7 @@ The model is **auto-detected from your hardware** — qwen8b for NVIDIA GPUs and
 
 > **Not sure?** On Mac, use `".[local]"`. On NVIDIA, use `".[local-quantized]"` — 4-bit quantization works on the widest range of NVIDIA hardware with minimal quality loss. (bitsandbytes requires CUDA and does not work on Mac/MPS.)
 
-**Python version:** PyTorch wheels lag behind new Python releases, so the local backend requires Python 3.11 or 3.12. If your default Python is 3.13+, install a managed 3.12 and pin the tool install to it:
+**Python version:** The local backend requires Python 3.11 – 3.14. If your default Python is newer, install a managed Python and pin the tool install to it:
 
 ```bash
 uv python install 3.12

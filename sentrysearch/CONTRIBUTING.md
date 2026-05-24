@@ -4,7 +4,7 @@ Thanks for your interest in contributing. This document covers the dev loop, con
 
 ## Dev setup
 
-Requires Python 3.11 or 3.12 (PyTorch wheels don't support 3.13+ yet).
+Requires Python 3.11 – 3.14.
 
 ```bash
 git clone https://github.com/ssrajadh/sentrysearch.git
