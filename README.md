@@ -11,6 +11,17 @@ autoCut 是一個用來把 360 / 一般影片做「語意搜尋」與「自動�
 
 > 簡單說：先讓 AI 看得快，再讓成品輸出得好。
 
+## 圖形介面 (GUI)
+
+```bash
+.venv/bin/python autocut_gui.py
+```
+
+開啟後即可選擇影片、輸入 prompt、一鍵執行剪輯。需先安裝 tkinter：
+```bash
+brew install python-tk@3.14
+```
+
 ## 這個專案是什麼
 
 autoCut 提供一個偏實用的影片處理流程：
