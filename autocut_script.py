@@ -80,7 +80,7 @@ def index_videos(videos: list[str], backend: str, model: str | None,
     )
     _validate_backend_options(backend, model, None)
     resolved = _resolve_model(backend, model, None)
-    viewport_prompt = "interesting scene"
+    viewport_prompt = "Choose the viewport angle whose content would work best in a video sequence — prioritize dynamic, engaging views with people, faces, or interesting foreground action. Avoid blank walls, corridors, or empty scenes. Consider what would look good edited together with surrounding shots."
     for v in videos:
         proj = detect_360_projection(v)
         is_360 = proj is not None
@@ -144,8 +144,10 @@ def ask_script(catalog: str, prompt: str, verbose: bool, auto_prompt: bool = Fal
             '  {"source_file": "檔案名", "start_time": 0, "end_time": 30, "narration": "這段在講什麼"},\n'
             "...\n"
             "]\n"
-            "注意：start_time 和 end_time 必須是 catalog 裡出現的數值，不可自創。\n"
-            "如果素材不足以編成有意義的影片，請回傳空陣列。"
+             "注意：\n"
+             "1. source_file 必須與 catalog 中的檔名完全相同（例如 LRV_xxx.lrv 請勿寫成 VID_xxx.lrv）。\n"
+             "2. start_time 和 end_time 必須是 catalog 裡出現的數值，不可自創。\n"
+             "如果素材不足以編成有意義的影片，請回傳空陣列。"
         )
     else:
         system = (
@@ -156,7 +158,9 @@ def ask_script(catalog: str, prompt: str, verbose: bool, auto_prompt: bool = Fal
             '  {"source_file": "檔案名", "start_time": 0, "end_time": 30, "narration": "這段在講什麼"},\n'
             "...\n"
             "]\n"
-            "注意：start_time 和 end_time 必須是 catalog 裡出現的數值，不可自創。" + (
+             "注意：\n"
+             "1. source_file 必須與 catalog 中的檔名完全相同（例如 LRV_xxx.lrv 請勿寫成 VID_xxx.lrv）。\n"
+             "2. start_time 和 end_time 必須是 catalog 裡出現的數值，不可自創。" + (
                 " 使用者額外要求：" + prompt if prompt else ""
             )
         )
@@ -227,6 +231,17 @@ def _parse_time(val: str | int | float) -> float:
     return float(val)
 
 
+def _source_key(filename: str) -> str:
+    """Normalize filename for fuzzy matching (strip LRV_/VID_ prefix and extension)."""
+    base = os.path.basename(filename)
+    for prefix in ("LRV_", "VID_", "lrv_", "vid_"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+    base = base.rsplit(".", 1)[0]
+    return base
+
+
 def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
     valid: list[dict] = []
     for item in script:
@@ -241,6 +256,7 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
                 r["source_file"] == src
                 or os.path.basename(r["source_file"]) == os.path.basename(src)
                 or os.path.basename(r["source_file"]) == src
+                or _source_key(r["source_file"]) == _source_key(src)
             )
             if not s_file_matches:
                 continue
@@ -311,24 +327,39 @@ def render(selected: list[dict], *, output_path: str,
         if not clip_files:
             raise RuntimeError("No clips were successfully trimmed.")
 
+        has_360 = any(s.get("is_360") for s in selected)
         with open(clip_list_path, "w", encoding="utf-8") as f:
             for cf in clip_files:
                 f.write(f"file '{os.path.abspath(cf)}'\n")
 
-        result = subprocess.run(
-            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-             "-c", "copy", output_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0 or not os.path.isfile(output_path):
-            click.echo("Stream copy failed, re-encoding...")
+        if has_360:
+            # Mixed 360 (re-encoded to h.264) and non-360 clips (original codec)
+            # may have incompatible codecs; always re-encode to a common format.
             result = subprocess.run(
                 [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-                 "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", output_path],
+                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                 "-c:a", "aac", "-b:a", "128k", output_path],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
+        else:
+            # All clips are the same source type; stream-copy is safe.
+            result = subprocess.run(
+                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
+                 "-c", "copy", output_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0 or not os.path.isfile(output_path):
+                click.echo("Stream copy failed, re-encoding...")
+                result = subprocess.run(
+                    [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
+                     "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", output_path],
+                    capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
 
         click.secho(f"\n✓ Script edit complete: {output_path}", fg="green", bold=True)
     finally:

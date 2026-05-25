@@ -1,4 +1,5 @@
 import os
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -33,7 +34,7 @@ class AutocutGUI(tk.Tk):
     def _init_vars(self):
         # normal mode
         self.video_path = tk.StringVar()
-        self.prompt = tk.StringVar(value="請找有人物出現、互動或畫面資訊比較有價值的片段")
+        self.prompt = tk.StringVar(value="Prefer the viewport with a clearly visible main person, face, or full body. Avoid empty scenery, corridors, walls, or signs. Only if no clear person is visible, choose the most impressive or scenic foreground view.")
         self.count = tk.IntVar(value=3)
         self.backend = tk.StringVar(value="local-api")
         self.is_360 = tk.BooleanVar(value=False)
@@ -41,10 +42,11 @@ class AutocutGUI(tk.Tk):
         self.face_path = tk.StringVar()
         self.verbose = tk.BooleanVar(value=False)
         self.force_reindex = tk.BooleanVar(value=False)
+        self.view_angle = tk.StringVar(value="auto")
 
         # script mode
         self.script_files: list[str] = []
-        self.script_prompt = tk.StringVar(value="請根據素材編一支有起承轉合的 30 秒短片")
+        self.script_prompt = tk.StringVar(value="請根據素材編一支有起承轉合的短片，長度由你自行決定")
         self.script_backend = tk.StringVar(value="local-api")
         self.script_verbose = tk.BooleanVar(value=False)
         self.script_output = tk.StringVar()
@@ -80,8 +82,10 @@ class AutocutGUI(tk.Tk):
         lf = ttk.Frame(main)
         lf.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(lf, height=10, wrap=tk.WORD, font=("Menlo", 9),
-                                state=tk.DISABLED, bg="#1e1e1e", fg="#d4d4d4",
+                                bg="#1e1e1e", fg="#d4d4d4",
                                 insertbackground="white")
+        self.log_text.configure(state=tk.DISABLED)
+        self._bind_readonly_text_shortcuts(self.log_text)
         self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
         scroll = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.log_text.yview)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -95,6 +99,27 @@ class AutocutGUI(tk.Tk):
         self.play_btn = ttk.Button(footer, text="▶ 播放輸出", command=self._play_output,
                                    state=tk.DISABLED)
         self.play_btn.pack(side=tk.RIGHT)
+
+    def _bind_readonly_text_shortcuts(self, text_widget: tk.Text):
+        def _select_all(_event=None):
+            text_widget.tag_add(tk.SEL, "1.0", tk.END)
+            text_widget.mark_set(tk.INSERT, "1.0")
+            text_widget.see(tk.INSERT)
+            return "break"
+
+        def _copy(_event=None):
+            try:
+                selected = text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            except tk.TclError:
+                return "break"
+            text_widget.clipboard_clear()
+            text_widget.clipboard_append(selected)
+            return "break"
+
+        for sequence in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):
+            text_widget.bind(sequence, _select_all)
+        for sequence in ("<Control-c>", "<Control-C>", "<Command-c>", "<Command-C>"):
+            text_widget.bind(sequence, _copy)
 
     # ── normal mode tab ──────────────────────────────────────────────
     def _build_normal_tab(self, parent):
@@ -127,7 +152,11 @@ class AutocutGUI(tk.Tk):
                      state="readonly", width=12).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
         ttk.Checkbutton(opts, text="360 模式", variable=self.is_360).grid(row=0, column=4, sticky=tk.W)
         ttk.Checkbutton(opts, text="詳細日誌", variable=self.verbose).grid(row=0, column=5, sticky=tk.W, padx=(10, 0))
-        ttk.Checkbutton(opts, text="強制重建索引", variable=self.force_reindex).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+        ttk.Label(opts, text="360 角度").grid(row=1, column=0, sticky=tk.W, padx=(0, 4))
+        ttk.Combobox(opts, textvariable=self.view_angle,
+                     values=["auto", "front", "right", "back", "left"],
+                     state="readonly", width=8).grid(row=1, column=1, sticky=tk.W, padx=(0, 20))
+        ttk.Checkbutton(opts, text="強制重建索引", variable=self.force_reindex).grid(row=1, column=2, columnspan=3, sticky=tk.W, pady=(6, 0))
 
         # face reference
         row2 = ttk.Frame(parent)
@@ -313,6 +342,9 @@ class AutocutGUI(tk.Tk):
             args.extend(["--face", face])
         if self.is_360.get():
             args.append("--360")
+        view = self.view_angle.get()
+        if view and view != "auto":
+            args.extend(["--view", view])
         if self.force_reindex.get():
             args.append("--force-reindex")
         if self.verbose.get():
@@ -323,6 +355,7 @@ class AutocutGUI(tk.Tk):
         self._log(f"  Prompt: {prompt}")
         self._log(f"  Backend: {self.backend.get()}")
         self._log(f"  Reindex: {'yes' if self.force_reindex.get() else 'no'}")
+        self._log(f"  360 View: {self.view_angle.get()}")
         self._log(f"  Output: {output}")
         self._log("")
 
