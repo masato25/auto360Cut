@@ -70,6 +70,7 @@ class AutocutGUI(tk.Tk):
         self.auto_files: list[str] = []
         self.auto_backend = tk.StringVar(value="local-api")
         self.auto_verbose = tk.BooleanVar(value=False)
+        self.auto_output_layout = tk.StringVar(value="landscape")
         self.auto_output = tk.StringVar()
 
         # date restore mode
@@ -160,10 +161,15 @@ class AutocutGUI(tk.Tk):
         if isinstance(auto_output, str):
             self.auto_output.set(auto_output)
 
+        auto_output_layout = data.get("auto_output_layout")
+        if auto_output_layout in {"landscape", "portrait"}:
+            self.auto_output_layout.set(auto_output_layout)
+
     def _save_state(self):
         data = {
             "auto_files": self.auto_files,
             "auto_output": self.auto_output.get().strip(),
+            "auto_output_layout": self.auto_output_layout.get(),
         }
         try:
             GUI_STATE_FILE.write_text(
@@ -364,7 +370,11 @@ class AutocutGUI(tk.Tk):
         ttk.Combobox(aopts, textvariable=self.auto_backend,
                      values=["local-api", "local", "qwen-cloud", "gemini"],
                      state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
-        ttk.Checkbutton(aopts, text="詳細日誌", variable=self.auto_verbose).grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(aopts, text="輸出版型").grid(row=0, column=2, sticky=tk.W, padx=(0, 4))
+        ttk.Combobox(aopts, textvariable=self.auto_output_layout,
+                     values=["landscape", "portrait"],
+                     state="readonly", width=10).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
+        ttk.Checkbutton(aopts, text="詳細日誌", variable=self.auto_verbose).grid(row=0, column=4, sticky=tk.W)
 
         # output
         ro = ttk.Frame(parent)
@@ -702,6 +712,7 @@ class AutocutGUI(tk.Tk):
             *self.auto_files,
             "--auto-prompt",
             "--backend", self.auto_backend.get(),
+            "--output-layout", self.auto_output_layout.get(),
             "-o", output,
         ]
         if self.auto_verbose.get():
@@ -713,6 +724,7 @@ class AutocutGUI(tk.Tk):
         for sf in self.auto_files:
             self._log(f"    {Path(sf).name}")
         self._log(f"  Backend: {self.auto_backend.get()}")
+        self._log(f"  Layout: {self.auto_output_layout.get()}")
         self._log(f"  Output: {output}")
         self._log("")
 

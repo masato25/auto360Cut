@@ -451,7 +451,37 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 
 
 # ── 4. render ────────────────────────────────────────────────────────
-def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str) -> str:
+OUTPUT_LAYOUT_CHOICES = ("landscape", "portrait")
+
+
+def _render_layout_filter(layout: str) -> tuple[str, int | None, int | None]:
+    """Return ffmpeg filter and dimensions for script-mode output layout."""
+    if layout == "portrait":
+        return (
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p",
+            1080,
+            1920,
+        )
+    if layout == "landscape":
+        return (
+            "scale=1280:720:force_original_aspect_ratio=decrease,"
+            "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p",
+            1280,
+            720,
+        )
+    raise ValueError(f"unknown output layout: {layout}")
+
+
+def _choose_output_layout(requested_layout: str) -> str:
+    if requested_layout not in OUTPUT_LAYOUT_CHOICES:
+        raise ValueError(
+            f"unknown output layout: {requested_layout}; choose 'landscape' or 'portrait'"
+        )
+    return requested_layout
+
+
+def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *, layout: str) -> str:
     """Re-encode a clip to one stable format before concat.
 
     The concat demuxer is fragile when neighboring clips have different
@@ -459,15 +489,15 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str) -
     was flattened to H.264 but the next non-360 clip is stream-copied from the
     camera: playback can keep showing the previous frame while audio advances.
     """
-    vf = (
-        "scale=1280:720:force_original_aspect_ratio=decrease,"
-        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-        "setsar=1,fps=30,format=yuv420p"
-    )
+    vf, width, height = _render_layout_filter(layout)
+    scale_args = []
+    if width and height:
+        scale_args = ["-s", f"{width}x{height}"]
     result = subprocess.run(
         [
             ffmpeg, "-y", "-i", input_path,
             "-vf", vf,
+            *scale_args,
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
@@ -482,7 +512,7 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str) -
 
 
 def render(selected: list[dict], *, output_path: str,
-           hq_dir: str | None) -> None:
+           hq_dir: str | None, output_layout: str) -> None:
     from autocut import convert_clip_to_flat, detect_360_projection
     from sentrysearch.trimmer import trim_clip
 
@@ -492,7 +522,12 @@ def render(selected: list[dict], *, output_path: str,
     clip_list_path = os.path.join(output_dir, "_script_concat.txt")
     clip_files: list[str] = []
     temp_files: list[str] = []
-    normalize_for_concat = any(s.get("is_360") for s in selected)
+    resolved_layout = _choose_output_layout(output_layout)
+    if resolved_layout == "portrait":
+        click.echo("  Output layout: portrait 1080x1920")
+    else:
+        click.echo("  Output layout: landscape 1280x720")
+    normalize_for_concat = True
 
     try:
         for i, s in enumerate(selected):
@@ -525,8 +560,8 @@ def render(selected: list[dict], *, output_path: str,
 
             if normalize_for_concat:
                 normalized_path = output_path.replace(".mp4", f"_{i}_norm.mp4")
-                click.echo("  Normalizing clip for mixed 360/non-360 concat...")
-                _normalize_clip_for_concat(ffmpeg, clip_path, normalized_path)
+                click.echo("  Normalizing clip for concat/output layout...")
+                _normalize_clip_for_concat(ffmpeg, clip_path, normalized_path, layout=resolved_layout)
                 temp_files.append(clip_path)
                 clip_path = normalized_path
 
@@ -635,10 +670,12 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Chat model for script generation. Defaults to AUTOCUT_SCRIPT_API_MODEL / OPENAI_MODEL / LOCAL_API_MODEL.")
 @click.option("--script-api-max-tokens", default=None, type=int,
               help="Max output tokens for script generation. Default: AUTOCUT_SCRIPT_API_MAX_TOKENS or 4096.")
+@click.option("--output-layout", type=click.Choice(OUTPUT_LAYOUT_CHOICES), default="landscape", show_default=True,
+              help="Final video shape: landscape (橫式) or portrait (直式).")
 @click.option("--verbose", is_flag=True)
 def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
-           script_api_key, script_api_model, script_api_max_tokens, verbose):
+           script_api_key, script_api_model, script_api_max_tokens, output_layout, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
     model = model or _auto_model()
@@ -697,7 +734,7 @@ def create(videos, prompt, output, backend, model,
 
     # 5. render
     click.echo("\n── 4. Rendering ──")
-    render(selected, output_path=output_path, hq_dir=hq_dir)
+    render(selected, output_path=output_path, hq_dir=hq_dir, output_layout=output_layout)
 
     click.echo(f"\nDone: {output_path}")
 
