@@ -177,6 +177,37 @@ chmod +x .venv/bin/python
 - **LRV 負責 AI 分析**
 - **HQ MP4 負責最後成品輸出**
 
+### 3. Enhance Mode（輸出增強）
+
+自動剪輯完成後可加一次 preset-based 的 ffmpeg 增強 pass，包含基本色彩/銳化與音量正規化，並會輸出一份可追蹤的 enhancement plan JSON。
+
+```bash
+./.venv/bin/python autocut.py autocut ./chain_trip/LRV_20260415_155421_01_001.lrv \
+  --hq-dir ./chain_trip_hq \
+  --prompt "first-person perspective or over-the-shoulder user viewpoint moments" \
+  --count 3 \
+  --enhance vivid \
+  -o ./autocut_hq_vivid.mp4
+```
+
+可用 preset：
+- `none`：不做增強（預設）
+- `light`：輕微對比、飽和、銳化與 loudness normalize
+- `vivid`：較鮮明的旅遊/動態素材風格
+- `cinematic`：較深對比、較克制飽和，並加 high-pass 音訊清理
+
+預設 plan 會寫到 `輸出檔.enhance-plan.json`，也可用 `--enhance-plan ./plan.json` 指定位置。
+
+Script Mode 也支援同樣參數：
+
+```bash
+./.venv/bin/python autocut_script.py create ./chain_trip/LRV_20260415_155421_01_001.lrv \
+  --auto-prompt \
+  --output-layout portrait \
+  --enhance light \
+  -o ./script_output.mp4
+```
+
 ## 360 影片建議流程
 
 如果你的來源是 Insta360：
@@ -225,6 +256,9 @@ chmod +x .venv/bin/python
 - `right`
 - `back`
 - `left`
+
+### `--enhance`
+在最終輸出後套用 preset-based 增強 pass。選項為 `none`、`light`、`vivid`、`cinematic`。啟用時會同時寫出 enhancement plan JSON，方便確認實際使用的 ffmpeg filter 與編碼設定。
 
 ### `--yaw`
 直接指定最後輸出使用的 yaw 角度；若有設定，優先權高於 `--view`。

@@ -25,6 +25,14 @@ except ModuleNotFoundError:
     sys.stderr.write("Install base deps first: pip install -r requirements.txt\n")
     raise SystemExit(1)
 
+from enhancement import (  # noqa: E402
+    ENHANCE_PRESETS,
+    apply_enhancement,
+    build_enhance_plan,
+    get_enhance_settings,
+    write_enhance_plan,
+)
+
 load_dotenv(ROOT / ".env")
 
 
@@ -553,7 +561,8 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *
 
 
 def render(selected: list[dict], *, output_path: str,
-           hq_dir: str | None, output_layout: str) -> None:
+           hq_dir: str | None, output_layout: str,
+           enhance: str = "none", enhance_plan_path: str | None = None) -> None:
     from autocut import convert_clip_to_flat, detect_360_projection
     from sentrysearch.trimmer import trim_clip
 
@@ -568,6 +577,9 @@ def render(selected: list[dict], *, output_path: str,
         click.echo("  Output layout: portrait 1080x1920")
     else:
         click.echo("  Output layout: landscape 1280x720")
+    enhance_settings = get_enhance_settings(enhance)
+    if enhance_settings.preset != "none":
+        click.echo(f"  Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
     normalize_for_concat = True
 
     try:
@@ -641,6 +653,19 @@ def render(selected: list[dict], *, output_path: str,
                 )
                 if result.returncode != 0:
                     raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
+
+        if enhance_settings.preset != "none":
+            plan = build_enhance_plan(
+                preset=enhance_settings.preset,
+                input_path=output_path,
+                output_path=output_path,
+                context="script",
+                extra={"clip_count": len(selected), "output_layout": resolved_layout},
+            )
+            plan_path = write_enhance_plan(plan, enhance_plan_path)
+            click.echo(f"  Enhancement plan: {plan_path}")
+            click.echo("  Applying enhancement pass...")
+            apply_enhancement(ffmpeg, output_path, output_path, preset=enhance_settings.preset)
 
         click.secho(f"\n✓ Script edit complete: {output_path}", fg="green", bold=True)
     finally:
@@ -717,11 +742,17 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Optional target final video duration in minutes for the script writer.")
 @click.option("--output-layout", type=click.Choice(OUTPUT_LAYOUT_CHOICES), default="landscape", show_default=True,
               help="Final video shape: landscape (橫式) or portrait (直式).")
+@click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
+              help="Apply a final preset-based video/audio enhancement pass.")
+@click.option("--enhance-plan", default=None,
+              type=click.Path(dir_okay=False),
+              help="Write enhancement plan JSON here. Defaults to OUTPUT.enhance-plan.json when --enhance is used.")
 @click.option("--verbose", is_flag=True)
 def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
            script_api_key, script_api_model, script_api_max_tokens,
-           catalog_max_chars, target_duration_minutes, output_layout, verbose):
+           catalog_max_chars, target_duration_minutes, output_layout,
+           enhance, enhance_plan, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
     model = model or _auto_model()
@@ -783,7 +814,14 @@ def create(videos, prompt, output, backend, model,
 
     # 5. render
     click.echo("\n── 4. Rendering ──")
-    render(selected, output_path=output_path, hq_dir=hq_dir, output_layout=output_layout)
+    render(
+        selected,
+        output_path=output_path,
+        hq_dir=hq_dir,
+        output_layout=output_layout,
+        enhance=enhance,
+        enhance_plan_path=str(Path(enhance_plan).expanduser().resolve()) if enhance_plan else None,
+    )
 
     click.echo(f"\nDone: {output_path}")
 

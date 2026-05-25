@@ -46,6 +46,14 @@ from sentrysearch.search import search_footage  # noqa: E402
 from sentrysearch.store import SentryStore  # noqa: E402
 from sentrysearch.trimmer import trim_clip  # noqa: E402
 
+from enhancement import (  # noqa: E402
+    ENHANCE_PRESETS,
+    apply_enhancement,
+    build_enhance_plan,
+    get_enhance_settings,
+    write_enhance_plan,
+)
+
 load_dotenv(ROOT / ".env")
 
 
@@ -130,6 +138,11 @@ def cli() -> None:
               help="Reference face photo. Focus on clips containing this person.")
 @click.option("--force-reindex", is_flag=True,
               help="Re-index this video so changed viewport prompts take effect.")
+@click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
+              help="Apply a final preset-based video/audio enhancement pass.")
+@click.option("--enhance-plan", default=None,
+              type=click.Path(dir_okay=False, path_type=Path),
+              help="Write enhancement plan JSON here. Defaults to OUTPUT.enhance-plan.json when --enhance is used.")
 @click.option("--verbose", is_flag=True, help="Show debug info.")
 def autocut_command(
     video: Path,
@@ -147,6 +160,8 @@ def autocut_command(
     is_360: bool | None,
     face: Path | None,
     force_reindex: bool,
+    enhance: str,
+    enhance_plan: Path | None,
     verbose: bool,
 ) -> None:
     """Project-specific autocut flow built on top of upstream sentrysearch."""
@@ -216,6 +231,8 @@ def autocut_command(
         view=view,
         yaw=yaw,
         detected_projection=projection,
+        enhance=enhance,
+        enhance_plan_path=str(enhance_plan.expanduser().resolve()) if enhance_plan else None,
     )
 
 
@@ -850,10 +867,14 @@ def _select_clips(rows: list[dict], *, prompt: str, count: int,
 
 def _render_autocut(selected: list[dict], *, source_video: str, output_path: str,
                     hq_source: str | None, hq_dir: str | None, view: str,
-                    yaw: float | None, detected_projection: str | None) -> None:
+                    yaw: float | None, detected_projection: str | None,
+                    enhance: str = "none", enhance_plan_path: str | None = None) -> None:
     trim_source = _resolve_hq_source(source_video, hq_source, hq_dir)
     if trim_source:
         click.echo(f"Using HQ trim source: {trim_source}")
+    enhance_settings = get_enhance_settings(enhance)
+    if enhance_settings.preset != "none":
+        click.echo(f"Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
 
     output_dir = os.path.dirname(output_path) or "."
     os.makedirs(output_dir, exist_ok=True)
@@ -922,6 +943,19 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
+
+        if enhance_settings.preset != "none":
+            plan = build_enhance_plan(
+                preset=enhance_settings.preset,
+                input_path=output_path,
+                output_path=output_path,
+                context="autocut",
+                extra={"clip_count": len(selected)},
+            )
+            plan_path = write_enhance_plan(plan, enhance_plan_path)
+            click.echo(f"Enhancement plan: {plan_path}")
+            click.echo("Applying enhancement pass...")
+            apply_enhancement(ffmpeg, output_path, output_path, preset=enhance_settings.preset)
         click.secho(f"\n✓ Auto-cut complete: {output_path}", fg="green", bold=True)
     finally:
         for cf in clip_files:
