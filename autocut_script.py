@@ -106,7 +106,7 @@ def collect_rows(videos: list[str], backend: str, model: str | None) -> list[dic
     return all_rows
 
 
-def format_catalog(rows: list[dict], max_chars: int = 3000) -> str:
+def format_catalog(rows: list[dict], max_chars: int | None = None) -> str:
     lines: list[str] = []
     by_file: dict[str, list[dict]] = {}
     for r in rows:
@@ -119,7 +119,7 @@ def format_catalog(rows: list[dict], max_chars: int = 3000) -> str:
             lines.append(f"  {_fmt_time(c['start_time'])}-{_fmt_time(c['end_time'])} | {cap}")
         lines.append("")
     text = "\n".join(lines)
-    if len(text) > max_chars:
+    if max_chars and max_chars > 0 and len(text) > max_chars:
         text = text[:max_chars].rsplit("\n", 1)[0] + "\n  ... (truncated)"
     return text
 
@@ -164,7 +164,7 @@ def _parse_json_or_recover_clips(content: str) -> list[dict]:
         raise original_error
 
 
-def _script_api_defaults() -> tuple[str, str, str, int]:
+def _script_api_defaults() -> tuple[str, str, str, int | None]:
     """Return OpenAI/ChatGPT-compatible API settings used only for script writing."""
     api_base = (
         os.environ.get("AUTOCUT_SCRIPT_API_BASE")
@@ -186,17 +186,25 @@ def _script_api_defaults() -> tuple[str, str, str, int]:
         or os.environ.get("LOCAL_API_MODEL")
         or "gpt-3.5-turbo"
     )
-    try:
-        max_tokens = int(os.environ.get("AUTOCUT_SCRIPT_API_MAX_TOKENS", "4096"))
-    except ValueError:
-        max_tokens = 4096
+    env_max_tokens = os.environ.get("AUTOCUT_SCRIPT_API_MAX_TOKENS", "").strip()
+    max_tokens: int | None = None
+    if env_max_tokens:
+        try:
+            max_tokens = int(env_max_tokens)
+            if max_tokens <= 0:
+                click.echo("  ⚠ AUTOCUT_SCRIPT_API_MAX_TOKENS must be positive; ignoring it.", err=True)
+                max_tokens = None
+        except ValueError:
+            click.echo("  ⚠ AUTOCUT_SCRIPT_API_MAX_TOKENS must be an integer; ignoring it.", err=True)
     return api_base, api_key, model, max_tokens
 
 
-def _safe_script_max_tokens(max_tokens: int) -> int:
+def _safe_script_max_tokens(max_tokens: int | None) -> int | None:
+    if max_tokens is None:
+        return None
     if max_tokens <= 0:
-        click.echo("  ⚠ AUTOCUT_SCRIPT_API_MAX_TOKENS must be positive; using 4096.", err=True)
-        return 4096
+        click.echo("  ⚠ --script-api-max-tokens must be positive; ignoring it.", err=True)
+        return None
     return max_tokens
 
 
@@ -238,42 +246,62 @@ def ask_script(
     script_api_key: str | None = None,
     script_api_model: str | None = None,
     script_api_max_tokens: int | None = None,
+    target_duration_minutes: float | None = None,
 ) -> list[dict]:
     default_api_base, default_api_key, default_model, default_max_tokens = _script_api_defaults()
     api_base = script_api_base or default_api_base
     api_key = script_api_key or default_api_key
     model = script_api_model or default_model
-    max_tokens = _safe_script_max_tokens(script_api_max_tokens or default_max_tokens)
+    max_tokens = _safe_script_max_tokens(script_api_max_tokens if script_api_max_tokens is not None else default_max_tokens)
+
+    highlight_instruction = (
+        "\nEditing strategy: Treat this as a highlight edit, not an even summary. "
+        "Do not distribute selections evenly across files and do not keep mediocre shots just for completeness. "
+        "Review the entire catalog and select only clips with strong information value, emotion, action, facial expression, beautiful visuals, transition value, or story progression. "
+        "Avoid long, repetitive, waiting, empty, badly shaky, unclear, low-value filler, or overly similar clips. "
+        "If multiple clips show the same event, usually keep only the strongest, clearest, or most useful one for story continuity. "
+        "The final rhythm should feel like a polished highlight video: a strong opening, varied middle, and satisfying ending. "
+        "Prefer short and precise over long and loose."
+    )
+
+    duration_instruction = ""
+    if target_duration_minutes and target_duration_minutes > 0:
+        duration_instruction = (
+            f"\nTarget final duration is about {target_duration_minutes:g} minutes. Try to get close, but do not pad the edit. "
+            "Highlight quality is more important than hitting the exact duration: when there are many strong clips, it is acceptable to be slightly longer; "
+            "when there are not enough strong clips, return a shorter edit instead of adding mediocre filler."
+        )
+
+    json_contract = (
+        "Return ONLY a valid JSON array. Do not wrap it in markdown and do not add explanations.\n"
+        "Each item must use this exact schema:\n"
+        "[\n"
+        '  {"source_file": "exact filename from catalog", "start_time": 0, "end_time": 30, "narration": "繁體中文段落說明"}\n'
+        "]\n"
+        "Strict rules:\n"
+        "1. source_file must exactly match a filename in the catalog, character-for-character. For example, do not change LRV_xxx.lrv to VID_xxx.lrv.\n"
+        "2. start_time and end_time must be numeric seconds taken from catalog segment boundaries. Never use HH:MM:SS or MM:SS strings.\n"
+        "3. Select from the entire catalog, not only the first few files or first few minutes.\n"
+        "4. narration must be written in Traditional Chinese.\n"
+        "5. If the material is insufficient for a meaningful edit, return []."
+    )
 
     if auto_prompt:
         system = (
-            "你是一個專業影片剪輯師。以下是所有素材的片段描述（時間軸、來源檔名、畫面內容）。\n"
-            "請自行分析這些素材的內容，判斷最適合的主題與故事線。\n"
-            "然後挑選片段編成一支有起承轉合的精彩短片。\n"
-            "回傳純 JSON 陣列，格式如下（start_time 和 end_time 必須是數字秒數，例如 0 或 30，不可用 00:00 格式）：\n"
-            "[\n"
-            '  {"source_file": "檔案名", "start_time": 0, "end_time": 30, "narration": "這段在講什麼"},\n'
-            "...\n"
-            "]\n"
-             "注意：\n"
-             "1. source_file 必須與 catalog 中的檔名完全相同（例如 LRV_xxx.lrv 請勿寫成 VID_xxx.lrv）。\n"
-             "2. start_time 和 end_time 必須是 catalog 裡出現的數值，不可自創。\n"
-             "如果素材不足以編成有意義的影片，請回傳空陣列。"
+            "You are a professional video editor. You will receive a catalog of source-video segments with timeline seconds, exact source filenames, and visual descriptions.\n"
+            "Analyze all available material yourself, infer the best theme and story arc, then choose clips for a tight highlight video with a clear beginning, development, turn, and ending.\n"
+            f"{highlight_instruction}\n"
+            f"{duration_instruction}\n"
+            f"{json_contract}"
         )
     else:
         system = (
-            "你是一個專業影片剪輯師。以下是所有素材的片段描述（時間軸、來源檔名、畫面內容）。\n"
-            "請根據使用者的要求，挑選最適合的片段，編成一支有起承轉合的影片。\n"
-            "回傳純 JSON 陣列，格式如下（start_time 和 end_time 必須是數字秒數，例如 0 或 30，不可用 00:00 格式）：\n"
-            "[\n"
-            '  {"source_file": "檔案名", "start_time": 0, "end_time": 30, "narration": "這段在講什麼"},\n'
-            "...\n"
-            "]\n"
-             "注意：\n"
-             "1. source_file 必須與 catalog 中的檔名完全相同（例如 LRV_xxx.lrv 請勿寫成 VID_xxx.lrv）。\n"
-             "2. start_time 和 end_time 必須是 catalog 裡出現的數值，不可自創。" + (
-                " 使用者額外要求：" + prompt if prompt else ""
-            )
+            "You are a professional video editor. You will receive a catalog of source-video segments with timeline seconds, exact source filenames, and visual descriptions.\n"
+            "Follow the user's request while still prioritizing a tight highlight edit with a clear beginning, development, turn, and ending.\n"
+            f"{highlight_instruction}\n"
+            f"{duration_instruction}\n"
+            f"{json_contract}"
+            + ("\nAdditional user request: " + prompt if prompt else "")
         )
 
     user_msg = f"素材目錄：\n\n{catalog}"
@@ -282,28 +310,41 @@ def ask_script(
         click.echo(f"\n── LLM prompt ──", err=True)
         click.echo(f"System: {system[:200]}...", err=True)
         click.echo(f"User: {user_msg[:500]}...", err=True)
-        click.echo(f"Script API: {api_base}  Model: {model}  Max tokens: {max_tokens}", err=True)
+        click.echo(f"Script API: {api_base}  Model: {model}" + (f"  Max tokens: {max_tokens}" if max_tokens else "  Max tokens: default/API-managed"), err=True)
 
     base_url = _normalize_openai_base_url(api_base)
 
+    def _is_unsupported_token_param_error(err: object) -> bool:
+        text = str(err).lower()
+        return "unsupported parameter" in text and ("max_tokens" in text or "max_output_tokens" in text)
+
     def _call_via_curl() -> str:
         import subprocess as _sub
-        payload = {
-            "model": model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-            "response_format": {"type": "json_object"},
-        }
-        result = _sub.run(
-            ["curl", "-s", "--max-time", "120",
-             f"{base_url}/chat/completions",
-             "-H", "Content-Type: application/json",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-d", json.dumps(payload)],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise ConnectionError(f"curl exit code {result.returncode}: {result.stderr.strip()}")
-        data = json.loads(result.stdout)
+
+        def _run(send_max_tokens: bool) -> dict:
+            payload = {
+                "model": model,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+                "response_format": {"type": "json_object"},
+            }
+            if send_max_tokens and max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            result = _sub.run(
+                ["curl", "-s", "--max-time", "120",
+                 f"{base_url}/chat/completions",
+                 "-H", "Content-Type: application/json",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-d", json.dumps(payload)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise ConnectionError(f"curl exit code {result.returncode}: {result.stderr.strip()}")
+            return json.loads(result.stdout)
+
+        data = _run(send_max_tokens=True)
+        if "error" in data and max_tokens is not None and _is_unsupported_token_param_error(data["error"]):
+            click.echo("  ⚠ token limit parameter not supported; retrying without it.", err=True)
+            data = _run(send_max_tokens=False)
         if "error" in data:
             raise RuntimeError(f"API error: {data['error']}")
         return data["choices"][0]["message"]["content"]
@@ -325,15 +366,15 @@ def ask_script(
                 ],
                 "response_format": {"type": "json_object"},
             }
-            if max_tokens > 0:
+            if max_tokens is not None:
                 call_kwargs["max_tokens"] = max_tokens
 
             try:
                 resp = client.chat.completions.create(**call_kwargs)
             except APIStatusError as api_err:
-                if "Unsupported parameter" in str(api_err):
+                if "max_tokens" in call_kwargs and _is_unsupported_token_param_error(api_err):
                     call_kwargs.pop("max_tokens", None)
-                    click.echo("  ⚠ max_tokens not supported; retrying without it.", err=True)
+                    click.echo("  ⚠ token limit parameter not supported; retrying without it.", err=True)
                     resp = client.chat.completions.create(**call_kwargs)
                 else:
                     raise
@@ -669,13 +710,18 @@ def index_command(videos, backend, model, force_reindex, verbose):
 @click.option("--script-api-model", default=None,
               help="Chat model for script generation. Defaults to AUTOCUT_SCRIPT_API_MODEL / OPENAI_MODEL / LOCAL_API_MODEL.")
 @click.option("--script-api-max-tokens", default=None, type=int,
-              help="Max output tokens for script generation. Default: AUTOCUT_SCRIPT_API_MAX_TOKENS or 4096.")
+              help="Optional max output tokens for script generation. Default: do not send a token limit unless AUTOCUT_SCRIPT_API_MAX_TOKENS is set.")
+@click.option("--catalog-max-chars", default=None, type=int,
+              help="Maximum characters of caption catalog sent to AI. Default: unlimited. Use 0 for unlimited.")
+@click.option("--target-duration-minutes", default=None, type=float,
+              help="Optional target final video duration in minutes for the script writer.")
 @click.option("--output-layout", type=click.Choice(OUTPUT_LAYOUT_CHOICES), default="landscape", show_default=True,
               help="Final video shape: landscape (橫式) or portrait (直式).")
 @click.option("--verbose", is_flag=True)
 def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
-           script_api_key, script_api_model, script_api_max_tokens, output_layout, verbose):
+           script_api_key, script_api_model, script_api_max_tokens,
+           catalog_max_chars, target_duration_minutes, output_layout, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
     model = model or _auto_model()
@@ -698,10 +744,12 @@ def create(videos, prompt, output, backend, model,
         raise SystemExit(1)
     click.echo(f"  {len(rows)} chunk(s) loaded.")
 
-    catalog = format_catalog(rows)
+    catalog_limit = None if catalog_max_chars is None or catalog_max_chars <= 0 else catalog_max_chars
+    catalog = format_catalog(rows, max_chars=catalog_limit)
+    click.echo(f"  Catalog: {len(catalog)} chars" + (" (unlimited)" if catalog_limit is None else f" (limited to {catalog_limit})"))
     if verbose:
         click.echo(f"\n── Catalog ({len(catalog)} chars)──")
-        click.echo(catalog[:2000])
+        click.echo(catalog[:4000])
 
     # 3. ask LLM
     click.echo("\n── 3. Asking AI for edit script ──")
@@ -716,6 +764,7 @@ def create(videos, prompt, output, backend, model,
         script_api_key=script_api_key,
         script_api_model=script_api_model,
         script_api_max_tokens=script_api_max_tokens,
+        target_duration_minutes=target_duration_minutes,
     )
     click.echo(f"  AI suggested {len(script)} clip(s).")
 

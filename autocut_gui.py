@@ -21,7 +21,7 @@ class AutocutGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("autoCut")
-        self.geometry("700x680")
+        self.geometry("760x720")
         self.minsize(600, 550)
 
         self._running = False
@@ -61,7 +61,7 @@ class AutocutGUI(tk.Tk):
 
         # script mode
         self.script_files: list[str] = []
-        self.script_prompt = tk.StringVar(value="請根據素材編一支有起承轉合的短片，長度由你自行決定")
+        self.script_prompt = tk.StringVar(value="請根據素材編一支精華短片，優先挑最精彩、有資訊量、有人物表情或故事推進的片段；長度可自行決定，寧可短而精準，不要為了湊長度加入普通片段")
         self.script_backend = tk.StringVar(value="local-api")
         self.script_verbose = tk.BooleanVar(value=False)
         self.script_output = tk.StringVar()
@@ -71,6 +71,9 @@ class AutocutGUI(tk.Tk):
         self.auto_backend = tk.StringVar(value="local-api")
         self.auto_verbose = tk.BooleanVar(value=False)
         self.auto_output_layout = tk.StringVar(value="landscape")
+        self.auto_target_duration = tk.StringVar(value="")
+        self.auto_script_max_tokens = tk.StringVar(value="")
+        self.auto_catalog_max_chars = tk.StringVar(value="")
         self.auto_output = tk.StringVar()
 
         # date restore mode
@@ -165,11 +168,26 @@ class AutocutGUI(tk.Tk):
         if auto_output_layout in {"landscape", "portrait"}:
             self.auto_output_layout.set(auto_output_layout)
 
+        auto_target_duration = data.get("auto_target_duration")
+        if isinstance(auto_target_duration, str):
+            self.auto_target_duration.set(auto_target_duration)
+        auto_script_max_tokens = data.get("auto_script_max_tokens")
+        if isinstance(auto_script_max_tokens, int) and auto_script_max_tokens > 0:
+            self.auto_script_max_tokens.set(str(auto_script_max_tokens))
+        elif isinstance(auto_script_max_tokens, str):
+            self.auto_script_max_tokens.set(auto_script_max_tokens)
+        auto_catalog_max_chars = data.get("auto_catalog_max_chars")
+        if isinstance(auto_catalog_max_chars, str):
+            self.auto_catalog_max_chars.set(auto_catalog_max_chars)
+
     def _save_state(self):
         data = {
             "auto_files": self.auto_files,
             "auto_output": self.auto_output.get().strip(),
             "auto_output_layout": self.auto_output_layout.get(),
+            "auto_target_duration": self.auto_target_duration.get().strip(),
+            "auto_script_max_tokens": self.auto_script_max_tokens.get().strip(),
+            "auto_catalog_max_chars": self.auto_catalog_max_chars.get().strip(),
         }
         try:
             GUI_STATE_FILE.write_text(
@@ -375,6 +393,14 @@ class AutocutGUI(tk.Tk):
                      values=["landscape", "portrait"],
                      state="readonly", width=10).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
         ttk.Checkbutton(aopts, text="詳細日誌", variable=self.auto_verbose).grid(row=0, column=4, sticky=tk.W)
+        ttk.Label(aopts, text="目標長度(分)").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(6, 0))
+        ttk.Entry(aopts, textvariable=self.auto_target_duration, width=8).grid(row=1, column=1, sticky=tk.W, padx=(0, 20), pady=(6, 0))
+        ttk.Label(aopts, text="輸出 tokens").grid(row=1, column=2, sticky=tk.W, padx=(0, 4), pady=(6, 0))
+        ttk.Entry(aopts, textvariable=self.auto_script_max_tokens, width=10).grid(row=1, column=3, sticky=tk.W, padx=(0, 20), pady=(6, 0))
+        ttk.Label(aopts, text="目錄字數上限").grid(row=1, column=4, sticky=tk.W, padx=(0, 4), pady=(6, 0))
+        ttk.Entry(aopts, textvariable=self.auto_catalog_max_chars, width=10).grid(row=1, column=5, sticky=tk.W, pady=(6, 0))
+        ttk.Label(parent, text="目錄字數留空＝完整送出；輸出 tokens 留空＝不傳 token 限制（建議）。若模型 context / output 不夠再填上限。",
+                  font=("", 9), foreground="gray", wraplength=700).pack(fill=tk.X, pady=(0, 6))
 
         # output
         ro = ttk.Frame(parent)
@@ -699,6 +725,33 @@ class AutocutGUI(tk.Tk):
             messagebox.showerror("錯誤", "請至少加入一部素材影片")
             return
 
+        script_max_tokens = self.auto_script_max_tokens.get().strip()
+        if script_max_tokens:
+            try:
+                if int(script_max_tokens) <= 0:
+                    raise ValueError
+            except Exception:
+                messagebox.showerror("錯誤", "輸出 tokens 必須是正整數，或留空代表不傳 token 限制")
+                return
+
+        target_duration = self.auto_target_duration.get().strip()
+        if target_duration:
+            try:
+                if float(target_duration) <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("錯誤", "目標長度必須是正數，或留空")
+                return
+
+        catalog_max_chars = self.auto_catalog_max_chars.get().strip()
+        if catalog_max_chars:
+            try:
+                if int(catalog_max_chars) <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("錯誤", "目錄字數上限必須是正整數，或留空代表完整送出")
+                return
+
         self._start_run("一鍵腳本剪輯中…", self.run_auto_btn)
 
         output = self.auto_output.get().strip()
@@ -715,6 +768,12 @@ class AutocutGUI(tk.Tk):
             "--output-layout", self.auto_output_layout.get(),
             "-o", output,
         ]
+        if script_max_tokens:
+            args.extend(["--script-api-max-tokens", script_max_tokens])
+        if target_duration:
+            args.extend(["--target-duration-minutes", target_duration])
+        if catalog_max_chars:
+            args.extend(["--catalog-max-chars", catalog_max_chars])
         if self.auto_verbose.get():
             args.append("--verbose")
 
@@ -725,6 +784,9 @@ class AutocutGUI(tk.Tk):
             self._log(f"    {Path(sf).name}")
         self._log(f"  Backend: {self.auto_backend.get()}")
         self._log(f"  Layout: {self.auto_output_layout.get()}")
+        self._log(f"  Script max tokens: {script_max_tokens or 'default/API-managed (not sent)'}")
+        self._log(f"  Target duration: {target_duration or 'auto'} min")
+        self._log(f"  Catalog limit: {catalog_max_chars or 'unlimited'} chars")
         self._log(f"  Output: {output}")
         self._log("")
 
