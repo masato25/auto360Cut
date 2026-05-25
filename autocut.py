@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import click
@@ -80,6 +81,9 @@ DEFAULT_PROMPT = (
 VIEW_CHOICES = ["auto", "front", "right", "back", "left"]
 VIEW_TO_YAW = {"front": 0, "right": 90, "back": 180, "left": 270}
 VIEWPORT_INDEX_VERSION = 2
+MIN_DISTINCT_CLIP_GAP_SECONDS = 20.0
+CAPTION_DUPLICATE_SIMILARITY = 0.86
+RENDER_CLIP_PADDING_SECONDS = 1.0
 DEFAULT_BACKEND = os.environ.get("AUTOCUT_BACKEND", "local-api")
 DEFAULT_LOCAL_MODEL = os.environ.get("AUTOCUT_LOCAL_MODEL", "qwen8b")
 
@@ -790,6 +794,57 @@ def _load_rows(video_path: str, *, backend: str, model: str | None) -> list[dict
     return rows
 
 
+def _normalize_caption_for_dedupe(caption: str) -> str:
+    """Normalize captions so repeated speech across nearby chunks compares equal."""
+    caption = caption.lower()
+    caption = re.sub(r"\b(?:front|right|back|left|auto):", " ", caption)
+    caption = re.sub(r"[^\w\s]+", " ", caption, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", caption).strip()
+
+
+def _caption_similarity(a: str, b: str) -> float:
+    a_norm = _normalize_caption_for_dedupe(a)
+    b_norm = _normalize_caption_for_dedupe(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm in b_norm or b_norm in a_norm:
+        return 1.0
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
+
+
+def _is_distinct_clip(candidate: dict, selected: list[dict]) -> bool:
+    """Reject alternate-universe duplicates of the same spoken moment.
+
+    Indexing uses overlapping 30s chunks (5s overlap).  Speech/caption models can
+    describe the same line in adjacent chunks or in different 360 viewports, so a
+    top-N request may otherwise return multiple clips with the same words but
+    slightly different start times or angles.  Keep only the first/best hit for
+    captions that are both temporally close/overlapping and textually near-identical.
+    """
+    c_start = float(candidate["start_time"])
+    c_end = float(candidate["end_time"])
+    c_caption = candidate.get("caption", "")
+    for existing in selected:
+        e_start = float(existing["start_time"])
+        e_end = float(existing["end_time"])
+        overlaps = c_start < e_end and e_start < c_end
+        starts_near = abs(c_start - e_start) < MIN_DISTINCT_CLIP_GAP_SECONDS
+        if not (overlaps or starts_near):
+            continue
+        if _caption_similarity(c_caption, existing.get("caption", "")) >= CAPTION_DUPLICATE_SIMILARITY:
+            return False
+    return True
+
+
+def _append_distinct_clip(candidate: dict, selected: list[dict], seen_ranges: set[tuple[float, float]]) -> bool:
+    key = (float(candidate["start_time"]), float(candidate["end_time"]))
+    if key in seen_ranges or not _is_distinct_clip(candidate, selected):
+        return False
+    selected.append(candidate)
+    seen_ranges.add(key)
+    return True
+
+
 def _select_clips(rows: list[dict], *, prompt: str, count: int,
                   backend: str, model: str | None,
                   quantize: bool | None, verbose: bool) -> list[dict]:
@@ -825,32 +880,86 @@ def _select_clips(rows: list[dict], *, prompt: str, count: int,
     for match in matches:
         key = (float(match["start_time"]), float(match["end_time"]))
         row = row_lookup.get(key)
-        if row is None or key in seen_ranges:
+        if row is None:
             continue
-        selected.append(row)
-        seen_ranges.add(key)
+        _append_distinct_clip(row, selected, seen_ranges)
         if len(selected) >= count:
             break
 
     if len(selected) < count:
         for row in rows:
-            key = (float(row["start_time"]), float(row["end_time"]))
-            if key in seen_ranges:
-                continue
-            selected.append(row)
-            seen_ranges.add(key)
+            _append_distinct_clip(row, selected, seen_ranges)
             if len(selected) >= count:
                 break
 
-    click.secho(f"\nSelected {len(selected)} clips:", fg="green", bold=True)
+    # Search results are ranked by semantic relevance, which can jump backward in
+    # the source video. Render the final autocut chronologically so the story does
+    # not appear to rewind between selected clips.
+    selected.sort(key=lambda s: (float(s["start_time"]), float(s["end_time"])))
+
+    click.secho(f"\nSelected {len(selected)} clips in timeline order:", fg="green", bold=True)
     for s in selected:
         click.echo(f"  [{_fmt_time(s['start_time'])}-{_fmt_time(s['end_time'])}] {s['caption'][:100]}")
     return selected
 
 
+def _copy_clip_with_times(row: dict, start_time: float, end_time: float) -> dict:
+    adjusted = dict(row)
+    adjusted["start_time"] = float(start_time)
+    adjusted["end_time"] = float(end_time)
+    return adjusted
+
+
+def _dedupe_render_ranges(selected: list[dict], *, padding: float = RENDER_CLIP_PADDING_SECONDS) -> list[dict]:
+    """Return timeline clips whose final padded render windows do not overlap.
+
+    Indexing uses overlapping chunks, and render trimming also adds padding.  If two
+    adjacent hits are close together, the final concatenated video can replay the
+    same few seconds with a different 360 viewport.  Trim the shared boundary before
+    calling trim_clip so internal cut points remain monotonic even after padding.
+    """
+    if not selected:
+        return []
+
+    adjusted = [_copy_clip_with_times(s, float(s["start_time"]), float(s["end_time"])) for s in selected]
+    adjusted.sort(key=lambda s: (float(s["start_time"]), float(s["end_time"])))
+
+    for prev, cur in zip(adjusted, adjusted[1:]):
+        prev_start = float(prev["start_time"])
+        prev_end = float(prev["end_time"])
+        cur_start = float(cur["start_time"])
+        cur_end = float(cur["end_time"])
+
+        # trim_clip adds padding to both sides, so even back-to-back windows would
+        # overlap by 2*padding unless the raw boundary is opened by that amount.
+        padded_overlap = (prev_end + padding) - max(0.0, cur_start - padding)
+        if padded_overlap <= 0:
+            continue
+
+        trim_from_prev = min(padded_overlap / 2.0, max(0.0, prev_end - prev_start))
+        trim_from_cur = min(padded_overlap - trim_from_prev, max(0.0, cur_end - cur_start))
+        remaining = padded_overlap - trim_from_prev - trim_from_cur
+        if remaining > 1e-6:
+            trim_more_prev = min(remaining, max(0.0, (prev_end - prev_start) - trim_from_prev))
+            trim_from_prev += trim_more_prev
+            remaining -= trim_more_prev
+            trim_from_cur += min(remaining, max(0.0, (cur_end - cur_start) - trim_from_cur))
+
+        prev["end_time"] = prev_end - trim_from_prev
+        cur["start_time"] = cur_start + trim_from_cur
+
+        if prev["end_time"] < prev["start_time"]:
+            prev["end_time"] = prev["start_time"]
+        if cur["start_time"] > cur["end_time"]:
+            cur["start_time"] = cur["end_time"]
+
+    return [s for s in adjusted if float(s["end_time"]) > float(s["start_time"])]
+
+
 def _render_autocut(selected: list[dict], *, source_video: str, output_path: str,
                     hq_source: str | None, hq_dir: str | None, view: str,
                     yaw: float | None, detected_projection: str | None) -> None:
+    selected = _dedupe_render_ranges(selected)
     trim_source = _resolve_hq_source(source_video, hq_source, hq_dir)
     if trim_source:
         click.echo(f"Using HQ trim source: {trim_source}")
@@ -879,7 +988,7 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
                     start_time=s["start_time"],
                     end_time=s["end_time"],
                     output_path=intermediate,
-                    padding=1.0,
+                    padding=RENDER_CLIP_PADDING_SECONDS,
                 )
                 proj = _projection_for_trim_source(trim_source or s["source_file"], s, detected_projection)
                 click.echo(
@@ -897,7 +1006,7 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
                     start_time=s["start_time"],
                     end_time=s["end_time"],
                     output_path=clip_path,
-                    padding=1.0,
+                    padding=RENDER_CLIP_PADDING_SECONDS,
                 )
             clip_files.append(clip_path)
 
