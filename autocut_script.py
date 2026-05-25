@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 
@@ -129,10 +131,119 @@ def _repair_json(text: str) -> str:
     return text
 
 
-def ask_script(catalog: str, prompt: str, verbose: bool, auto_prompt: bool = False) -> list[dict]:
-    api_base = os.environ.get("LOCAL_API_BASE", "http://192.168.0.207:8080")
-    api_key = os.environ.get("LOCAL_API_KEY", "not-needed")
-    model = os.environ.get("LOCAL_API_MODEL", "")
+def _coerce_script_response(data: object) -> list[dict]:
+    if isinstance(data, dict):
+        data = data.get("clips") or data.get("script") or data.get("items") or list(data.values())[0]
+    if not isinstance(data, list):
+        raise ValueError("response is not a list")
+    return data
+
+
+def _parse_json_or_recover_clips(content: str) -> list[dict]:
+    """Parse LLM JSON, recovering complete clip objects if the response is truncated."""
+    try:
+        return _coerce_script_response(json.loads(content))
+    except json.JSONDecodeError as original_error:
+        decoder = json.JSONDecoder()
+        clips: list[dict] = []
+        # Recover any complete top-level objects. This handles responses like:
+        # [{...}, {...}, {"source_file": "truncated
+        for match in re.finditer(r'\{', content):
+            try:
+                obj, _ = decoder.raw_decode(content[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and {"source_file", "start_time", "end_time"} <= set(obj):
+                clips.append(obj)
+        if clips:
+            click.echo(
+                f"Recovered {len(clips)} complete clip(s) from a truncated LLM response.",
+                err=True,
+            )
+            return clips
+        raise original_error
+
+
+def _script_api_defaults() -> tuple[str, str, str, int]:
+    """Return OpenAI/ChatGPT-compatible API settings used only for script writing."""
+    api_base = (
+        os.environ.get("AUTOCUT_SCRIPT_API_BASE")
+        or os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_API_BASE")
+        or os.environ.get("LOCAL_API_BASE")
+        or "http://192.168.0.207:8080"
+    )
+    api_key = (
+        os.environ.get("AUTOCUT_SCRIPT_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("LOCAL_API_KEY")
+        or "not-needed"
+    )
+    model = (
+        os.environ.get("AUTOCUT_SCRIPT_API_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or os.environ.get("OPENAI_API_MODEL")
+        or os.environ.get("LOCAL_API_MODEL")
+        or "gpt-3.5-turbo"
+    )
+    try:
+        max_tokens = int(os.environ.get("AUTOCUT_SCRIPT_API_MAX_TOKENS", "4096"))
+    except ValueError:
+        max_tokens = 4096
+    return api_base, api_key, model, max_tokens
+
+
+def _safe_script_max_tokens(max_tokens: int) -> int:
+    if max_tokens <= 0:
+        click.echo("  ⚠ AUTOCUT_SCRIPT_API_MAX_TOKENS must be positive; using 4096.", err=True)
+        return 4096
+    return max_tokens
+
+
+def _normalize_openai_base_url(api_base: str) -> str:
+    base_url = api_base.strip().rstrip("/")
+    if not base_url:
+        raise ValueError("script API base URL is empty")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    return base_url
+
+
+def _check_api_tcp_connectivity(base_url: str, timeout: float = 3.0) -> tuple[bool, str]:
+    """Check whether the script API host:port is reachable before SDK call."""
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        return False, f"cannot parse host from API URL: {base_url}"
+    if parsed.port:
+        port = parsed.port
+    elif parsed.scheme == "https":
+        port = 443
+    else:
+        port = 80
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, f"{host}:{port} reachable"
+    except OSError as exc:
+        return False, f"cannot connect to {host}:{port} ({exc})"
+
+
+def ask_script(
+    catalog: str,
+    prompt: str,
+    verbose: bool,
+    auto_prompt: bool = False,
+    *,
+    script_api_base: str | None = None,
+    script_api_key: str | None = None,
+    script_api_model: str | None = None,
+    script_api_max_tokens: int | None = None,
+) -> list[dict]:
+    default_api_base, default_api_key, default_model, default_max_tokens = _script_api_defaults()
+    api_base = script_api_base or default_api_base
+    api_key = script_api_key or default_api_key
+    model = script_api_model or default_model
+    max_tokens = _safe_script_max_tokens(script_api_max_tokens or default_max_tokens)
 
     if auto_prompt:
         system = (
@@ -171,23 +282,88 @@ def ask_script(catalog: str, prompt: str, verbose: bool, auto_prompt: bool = Fal
         click.echo(f"\n── LLM prompt ──", err=True)
         click.echo(f"System: {system[:200]}...", err=True)
         click.echo(f"User: {user_msg[:500]}...", err=True)
+        click.echo(f"Script API: {api_base}  Model: {model}  Max tokens: {max_tokens}", err=True)
+
+    base_url = _normalize_openai_base_url(api_base)
+
+    def _call_via_curl() -> str:
+        import subprocess as _sub
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
+            "response_format": {"type": "json_object"},
+        }
+        result = _sub.run(
+            ["curl", "-s", "--max-time", "120",
+             f"{base_url}/chat/completions",
+             "-H", "Content-Type: application/json",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-d", json.dumps(payload)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise ConnectionError(f"curl exit code {result.returncode}: {result.stderr.strip()}")
+        data = json.loads(result.stdout)
+        if "error" in data:
+            raise RuntimeError(f"API error: {data['error']}")
+        return data["choices"][0]["message"]["content"]
 
     try:
-        from openai import OpenAI
-        client = OpenAI(base_url=f"{api_base.rstrip('/')}/v1", api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model or "gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=2048,
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content
+        from openai import OpenAI, APIStatusError
+        click.echo(f"  Script API: {base_url}  Model: {model}", err=True)
+        ok, detail = _check_api_tcp_connectivity(base_url)
+        if ok:
+            if verbose:
+                click.echo(f"  API connectivity: {detail}", err=True)
+            client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
+
+            call_kwargs: dict = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                "response_format": {"type": "json_object"},
+            }
+            if max_tokens > 0:
+                call_kwargs["max_tokens"] = max_tokens
+
+            try:
+                resp = client.chat.completions.create(**call_kwargs)
+            except APIStatusError as api_err:
+                if "Unsupported parameter" in str(api_err):
+                    call_kwargs.pop("max_tokens", None)
+                    click.echo("  ⚠ max_tokens not supported; retrying without it.", err=True)
+                    resp = client.chat.completions.create(**call_kwargs)
+                else:
+                    raise
+
+            content = resp.choices[0].message.content
+        else:
+            if verbose:
+                click.echo(f"  API connectivity: {detail} — falling back to curl", err=True)
+            content = _call_via_curl()
+    except (OSError, ConnectionError):
+        click.echo("  ⚠ Python network blocked; falling back to curl...", err=True)
+        content = _call_via_curl()
     except Exception as e:
-        click.echo(f"LLM call failed: {e}", err=True)
+        click.echo(f"LLM call failed: {type(e).__name__}: {e}", err=True)
+        click.echo(
+            "  Check script API settings: --script-api-base / --script-api-model, "
+            "or .env AUTOCUT_SCRIPT_API_BASE / AUTOCUT_SCRIPT_API_MODEL.",
+            err=True,
+        )
+        click.echo(
+            "  For a local server, verify it is running and reachable from this Mac, e.g.:\n"
+            f"    curl {base_url}/models\n"
+            "  If the service is on another machine, check IP address, port, firewall, and that it listens on 0.0.0.0 not only 127.0.0.1.",
+            err=True,
+        )
+        click.echo(
+            "  Example for OpenAI: --script-api-base https://api.openai.com/v1 "
+            "--script-api-model gpt-4o-mini --script-api-key $OPENAI_API_KEY",
+            err=True,
+        )
         raise SystemExit(1)
 
     if verbose:
@@ -203,12 +379,7 @@ def ask_script(catalog: str, prompt: str, verbose: bool, auto_prompt: bool = Fal
     content = _repair_json(content)
 
     try:
-        data = json.loads(content)
-        if isinstance(data, dict):
-            data = data.get("script") or data.get("clips") or list(data.values())[0]
-        if not isinstance(data, list):
-            raise ValueError("response is not a list")
-        return data
+        return _parse_json_or_recover_clips(content)
     except (json.JSONDecodeError, ValueError) as e:
         click.echo(f"Failed to parse LLM response: {e}", err=True)
         hint = "The response was likely truncated. Try running again or with a more specific --prompt to reduce scope." if len(content) < 500 else ""
@@ -280,6 +451,36 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 
 
 # ── 4. render ────────────────────────────────────────────────────────
+def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str) -> str:
+    """Re-encode a clip to one stable format before concat.
+
+    The concat demuxer is fragile when neighboring clips have different
+    dimensions/codecs/time bases.  This is especially visible when a 360 clip
+    was flattened to H.264 but the next non-360 clip is stream-copied from the
+    camera: playback can keep showing the previous frame while audio advances.
+    """
+    vf = (
+        "scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,fps=30,format=yuv420p"
+    )
+    result = subprocess.run(
+        [
+            ffmpeg, "-y", "-i", input_path,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+            "-movflags", "+faststart",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        raise RuntimeError(result.stderr.strip() or "ffmpeg clip normalization failed")
+    return output_path
+
+
 def render(selected: list[dict], *, output_path: str,
            hq_dir: str | None) -> None:
     from autocut import convert_clip_to_flat, detect_360_projection
@@ -290,6 +491,8 @@ def render(selected: list[dict], *, output_path: str,
     os.makedirs(output_dir, exist_ok=True)
     clip_list_path = os.path.join(output_dir, "_script_concat.txt")
     clip_files: list[str] = []
+    temp_files: list[str] = []
+    normalize_for_concat = any(s.get("is_360") for s in selected)
 
     try:
         for i, s in enumerate(selected):
@@ -300,6 +503,7 @@ def render(selected: list[dict], *, output_path: str,
                 yaw = s.get("best_yaw", 0)
                 direction = s.get("best_direction", "front")
                 intermediate = clip_path.replace(".mp4", "_raw.mp4")
+                temp_files.append(intermediate)
                 trim_clip(
                     source_file=trim_source,
                     start_time=s["start_time"],
@@ -310,10 +514,6 @@ def render(selected: list[dict], *, output_path: str,
                 proj = detect_360_projection(trim_source) or s.get("projection", "equirect")
                 click.echo(f"  Converting 360 ({direction}, yaw={yaw})...")
                 convert_clip_to_flat(intermediate, clip_path, yaw=yaw, projection=proj)
-                try:
-                    os.unlink(intermediate)
-                except OSError:
-                    pass
             else:
                 trim_clip(
                     source_file=trim_source,
@@ -322,27 +522,32 @@ def render(selected: list[dict], *, output_path: str,
                     output_path=clip_path,
                     padding=1.0,
                 )
+
+            if normalize_for_concat:
+                normalized_path = output_path.replace(".mp4", f"_{i}_norm.mp4")
+                click.echo("  Normalizing clip for mixed 360/non-360 concat...")
+                _normalize_clip_for_concat(ffmpeg, clip_path, normalized_path)
+                temp_files.append(clip_path)
+                clip_path = normalized_path
+
             clip_files.append(clip_path)
 
         if not clip_files:
             raise RuntimeError("No clips were successfully trimmed.")
 
-        has_360 = any(s.get("is_360") for s in selected)
         with open(clip_list_path, "w", encoding="utf-8") as f:
             for cf in clip_files:
                 f.write(f"file '{os.path.abspath(cf)}'\n")
 
-        if has_360:
-            # Mixed 360 (re-encoded to h.264) and non-360 clips (original codec)
-            # may have incompatible codecs; always re-encode to a common format.
+        if normalize_for_concat:
+            # Clips were already normalized to identical H.264/AAC parameters, so
+            # stream-copy concat is safe and avoids a second generation loss.
             result = subprocess.run(
                 [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                 "-c:a", "aac", "-b:a", "128k", output_path],
+                 "-c", "copy", output_path],
                 capture_output=True, text=True,
             )
-            if result.returncode != 0:
+            if result.returncode != 0 or not os.path.isfile(output_path):
                 raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
         else:
             # All clips are the same source type; stream-copy is safe.
@@ -363,7 +568,7 @@ def render(selected: list[dict], *, output_path: str,
 
         click.secho(f"\n✓ Script edit complete: {output_path}", fg="green", bold=True)
     finally:
-        for cf in clip_files:
+        for cf in clip_files + temp_files:
             try:
                 os.unlink(cf)
             except OSError:
@@ -378,6 +583,30 @@ def render(selected: list[dict], *, output_path: str,
 @click.group()
 def cli():
     """autoCut Script Mode – AI writes an edit script from your footage."""
+
+
+@cli.command("index")
+@click.argument("videos", nargs=-1, required=True,
+                type=click.Path(exists=True, dir_okay=False))
+@click.option("--backend", default=None,
+              help="Backend (default: from .env AUTOCUT_BACKEND).")
+@click.option("--model", default=None,
+              help="Model override.")
+@click.option("--force-reindex", is_flag=True,
+              help="Re-index all videos.")
+@click.option("--verbose", is_flag=True)
+def index_command(videos, backend, model, force_reindex, verbose):
+    """Index videos only, without creating or rendering an edit."""
+    backend = backend or _auto_backend()
+    model = model or _auto_model()
+
+    click.echo(f"autoCut Index — {len(videos)} video(s)")
+    click.echo(f"Backend: {backend}")
+    click.echo("\n── Indexing videos ──")
+    for v in videos:
+        click.echo(f"  {os.path.basename(v)}")
+    index_videos(list(videos), backend, model, force_reindex, verbose)
+    click.secho("\n✓ Indexing complete. You can now use 一般剪輯 / 腳本模式 / 一鍵腳本 faster.", fg="green", bold=True)
 
 
 @cli.command()
@@ -398,9 +627,18 @@ def cli():
               help="Re-index all videos.")
 @click.option("--auto-prompt", is_flag=True,
               help="Let AI decide the story theme automatically (no user prompt needed).")
+@click.option("--script-api-base", default=None,
+              help="OpenAI-compatible API base URL for script generation (e.g. https://api.openai.com/v1).")
+@click.option("--script-api-key", default=None,
+              help="API key for script generation. Defaults to AUTOCUT_SCRIPT_API_KEY / OPENAI_API_KEY / LOCAL_API_KEY.")
+@click.option("--script-api-model", default=None,
+              help="Chat model for script generation. Defaults to AUTOCUT_SCRIPT_API_MODEL / OPENAI_MODEL / LOCAL_API_MODEL.")
+@click.option("--script-api-max-tokens", default=None, type=int,
+              help="Max output tokens for script generation. Default: AUTOCUT_SCRIPT_API_MAX_TOKENS or 4096.")
 @click.option("--verbose", is_flag=True)
 def create(videos, prompt, output, backend, model,
-           hq_dir, force_reindex, auto_prompt, verbose):
+           hq_dir, force_reindex, auto_prompt, script_api_base,
+           script_api_key, script_api_model, script_api_max_tokens, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
     model = model or _auto_model()
@@ -432,7 +670,16 @@ def create(videos, prompt, output, backend, model,
     click.echo("\n── 3. Asking AI for edit script ──")
     if auto_prompt:
         click.echo("  (AI will decide the theme and story automatically)")
-    script = ask_script(catalog, prompt, verbose, auto_prompt=auto_prompt)
+    script = ask_script(
+        catalog,
+        prompt,
+        verbose,
+        auto_prompt=auto_prompt,
+        script_api_base=script_api_base,
+        script_api_key=script_api_key,
+        script_api_model=script_api_model,
+        script_api_max_tokens=script_api_max_tokens,
+    )
     click.echo(f"  AI suggested {len(script)} clip(s).")
 
     # 4. validate

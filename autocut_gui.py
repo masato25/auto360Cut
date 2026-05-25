@@ -1,6 +1,8 @@
+import json
 import os
-import os
+import signal
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from tkinter import ttk, filedialog, messagebox
 AUTOCUT_SCRIPT = Path(__file__).parent / "autocut.py"
 AUTOCUT_SCRIPT_SCRIPT = Path(__file__).parent / "autocut_script.py"
 PYTHON_BIN = Path(__file__).parent / ".venv" / "bin" / "python"
+GUI_STATE_FILE = Path.home() / ".autocut_gui_state.json"
 
 
 class AutocutGUI(tk.Tk):
@@ -21,10 +24,15 @@ class AutocutGUI(tk.Tk):
         self.minsize(600, 550)
 
         self._running = False
+        self._stopping = False
+        self._current_proc: subprocess.Popen | None = None
         self._last_output: str | None = None
+        self._last_success_message = "✓ 剪輯完成！"
         self._init_styles()
         self._init_vars()
         self._build_ui()
+        self._load_state()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _init_styles(self):
         self.style = ttk.Style()
@@ -32,6 +40,12 @@ class AutocutGUI(tk.Tk):
             self.style.theme_use("aqua")
 
     def _init_vars(self):
+        # index mode
+        self.index_files: list[str] = []
+        self.index_backend = tk.StringVar(value="local-api")
+        self.index_verbose = tk.BooleanVar(value=False)
+        self.index_force_reindex = tk.BooleanVar(value=False)
+
         # normal mode
         self.video_path = tk.StringVar()
         self.prompt = tk.StringVar(value="Prefer the viewport with a clearly visible main person, face, or full body. Avoid empty scenery, corridors, walls, or signs. Only if no clear person is visible, choose the most impressive or scenic foreground view.")
@@ -63,6 +77,10 @@ class AutocutGUI(tk.Tk):
 
         notebook = ttk.Notebook(main)
 
+        index_tab = ttk.Frame(notebook)
+        notebook.add(index_tab, text="索引素材")
+        self._build_index_tab(index_tab)
+
         normal_tab = ttk.Frame(notebook)
         notebook.add(normal_tab, text="一般剪輯")
         self._build_normal_tab(normal_tab)
@@ -76,6 +94,16 @@ class AutocutGUI(tk.Tk):
         self._build_auto_tab(auto_tab)
 
         notebook.pack(fill=tk.X, pady=(0, 10))
+
+        # shared progress
+        progress_frame = ttk.Frame(main)
+        progress_frame.pack(fill=tk.X, pady=(0, 8))
+        self.progress_label = ttk.Label(progress_frame, text="狀態：待命", font=("", 10))
+        self.progress_label.pack(side=tk.LEFT)
+        self.progress_bar = ttk.Progressbar(progress_frame, mode="indeterminate")
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 8))
+        self.stop_btn = ttk.Button(progress_frame, text="強制停止", command=self._stop_process, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.RIGHT)
 
         # shared log
         ttk.Label(main, text="執行紀錄", font=("", 11, "bold")).pack(anchor=tk.W)
@@ -100,6 +128,46 @@ class AutocutGUI(tk.Tk):
                                    state=tk.DISABLED)
         self.play_btn.pack(side=tk.RIGHT)
 
+    def _load_state(self):
+        try:
+            data = json.loads(GUI_STATE_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self._log(f"⚠ 無法讀取上次暫存列表: {exc}")
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        auto_files = data.get("auto_files", [])
+        if isinstance(auto_files, list):
+            self.auto_files = [str(f) for f in auto_files if isinstance(f, str)]
+            self._refresh_auto_listbox()
+
+        auto_output = data.get("auto_output")
+        if isinstance(auto_output, str):
+            self.auto_output.set(auto_output)
+
+    def _save_state(self):
+        data = {
+            "auto_files": self.auto_files,
+            "auto_output": self.auto_output.get().strip(),
+        }
+        try:
+            GUI_STATE_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self._log(f"⚠ 無法暫存目前列表: {exc}")
+
+    def _on_close(self):
+        self._save_state()
+        if self._running:
+            self._stop_process()
+        self.destroy()
+
     def _bind_readonly_text_shortcuts(self, text_widget: tk.Text):
         def _select_all(_event=None):
             text_widget.tag_add(tk.SEL, "1.0", tk.END)
@@ -120,6 +188,42 @@ class AutocutGUI(tk.Tk):
             text_widget.bind(sequence, _select_all)
         for sequence in ("<Control-c>", "<Control-C>", "<Command-c>", "<Command-C>"):
             text_widget.bind(sequence, _copy)
+
+    # ── index mode tab ───────────────────────────────────────────────
+    def _build_index_tab(self, parent):
+        vl = ttk.Frame(parent)
+        vl.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(vl, text="先把素材建立索引，之後一般剪輯 / 腳本模式 / 一鍵腳本會直接重用快取",
+                  font=("", 11, "bold")).pack(anchor=tk.W)
+        lrow = ttk.Frame(vl)
+        lrow.pack(fill=tk.X, pady=(4, 0))
+        self.index_listbox = tk.Listbox(lrow, height=7, font=("Menlo", 10))
+        self.index_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        btn_frame = ttk.Frame(lrow)
+        btn_frame.pack(side=tk.RIGHT, padx=(6, 0), fill=tk.Y)
+        ttk.Button(btn_frame, text="新增影片…", command=self._index_add_files).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="移除選取", command=self._index_remove_selected).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="清空", command=self._index_clear_files).pack()
+
+        opts = ttk.Frame(parent)
+        opts.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(opts, text="後端").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        ttk.Combobox(opts, textvariable=self.index_backend,
+                     values=["local-api", "local", "qwen-cloud", "gemini"],
+                     state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
+        ttk.Checkbutton(opts, text="詳細日誌", variable=self.index_verbose).grid(row=0, column=2, sticky=tk.W, padx=(0, 12))
+        ttk.Checkbutton(opts, text="強制重建索引", variable=self.index_force_reindex).grid(row=0, column=3, sticky=tk.W)
+
+        hint = ttk.Label(
+            parent,
+            text="提示：如果只是新增素材，不用勾強制重建；改了 360 視角提示或想刷新舊資料才需要重建。",
+            foreground="gray",
+            wraplength=620,
+        )
+        hint.pack(fill=tk.X, pady=(0, 6))
+
+        self.run_index_btn = ttk.Button(parent, text="▶ 開始索引素材", command=self._run_index)
+        self.run_index_btn.pack(pady=(6, 0))
 
     # ── normal mode tab ──────────────────────────────────────────────
     def _build_normal_tab(self, parent):
@@ -239,7 +343,8 @@ class AutocutGUI(tk.Tk):
         btn_frame = ttk.Frame(lrow)
         btn_frame.pack(side=tk.RIGHT, padx=(6, 0), fill=tk.Y)
         ttk.Button(btn_frame, text="新增影片…", command=self._auto_add_files).pack(pady=(0, 4))
-        ttk.Button(btn_frame, text="移除選取", command=self._auto_remove_selected).pack()
+        ttk.Button(btn_frame, text="移除選取", command=self._auto_remove_selected).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="清空", command=self._auto_clear_files).pack()
 
         # options
         aopts = ttk.Frame(parent)
@@ -262,6 +367,91 @@ class AutocutGUI(tk.Tk):
         # run
         self.run_auto_btn = ttk.Button(parent, text="▶ 一鍵腳本剪輯", command=self._run_auto)
         self.run_auto_btn.pack(pady=(6, 0))
+
+    # ── index mode actions ───────────────────────────────────────────
+    def _index_add_files(self):
+        files = filedialog.askopenfilenames(
+            title="選擇要索引的素材影片",
+            filetypes=[("影片", "*.mp4 *.mov *.lrv *.insv"), ("所有檔案", "*.*")]
+        )
+        if not files:
+            return
+        for f in files:
+            if f not in self.index_files:
+                self.index_files.append(f)
+                self.index_listbox.insert(tk.END, Path(f).name)
+
+    def _index_remove_selected(self):
+        sel = self.index_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.index_listbox.delete(idx)
+        del self.index_files[idx]
+
+    def _index_clear_files(self):
+        self.index_files.clear()
+        self.index_listbox.delete(0, tk.END)
+
+    def _find_already_indexed_files(self, files: list[str]) -> list[str]:
+        try:
+            if str(Path(__file__).parent / "sentrysearch") not in sys.path:
+                sys.path.insert(0, str(Path(__file__).parent / "sentrysearch"))
+            from dotenv import load_dotenv
+            from sentrysearch.store import SentryStore
+
+            load_dotenv(Path(__file__).parent / ".env")
+            model = os.environ.get("LOCAL_API_MODEL") or None
+            store = SentryStore(backend=self.index_backend.get(), model=model)
+            return [f for f in files if store.is_indexed(f)]
+        except Exception as exc:
+            self._log(f"⚠ 無法預先檢查索引快取，將交由索引流程判斷: {exc}")
+            return []
+
+    def _run_index(self):
+        if self._running:
+            return
+        if not self.index_files:
+            messagebox.showerror("錯誤", "請至少加入一部素材影片")
+            return
+
+        already_indexed = []
+        if not self.index_force_reindex.get():
+            already_indexed = self._find_already_indexed_files(self.index_files)
+            if already_indexed:
+                names = "\n".join(f"• {Path(f).name}" for f in already_indexed)
+                messagebox.showinfo(
+                    "已建立索引",
+                    "以下影片已經建立過索引，這次會跳過：\n\n"
+                    f"{names}\n\n若要重新建立，請勾選「強制重建索引」。",
+                )
+
+        self._start_run("索引中…", self.run_index_btn)
+
+        args = [
+            str(PYTHON_BIN), str(AUTOCUT_SCRIPT_SCRIPT), "index",
+            *self.index_files,
+            "--backend", self.index_backend.get(),
+        ]
+        if self.index_force_reindex.get():
+            args.append("--force-reindex")
+        if self.index_verbose.get():
+            args.append("--verbose")
+
+        self._clear_log()
+        self._last_success_message = "✓ 素材索引完成！現在可以切到一般剪輯 / 腳本模式 / 一鍵腳本使用。"
+        self._log(f"▶ 開始索引素材: {len(self.index_files)} 部")
+        for f in self.index_files:
+            self._log(f"    {Path(f).name}")
+        self._log(f"  Backend: {self.index_backend.get()}")
+        self._log(f"  Reindex: {'yes' if self.index_force_reindex.get() else 'no'}")
+        if already_indexed:
+            self._log(f"  已索引將跳過: {len(already_indexed)} 部")
+            for f in already_indexed:
+                self._log(f"    skip: {Path(f).name}")
+        self._log("")
+
+        threading.Thread(target=self._run_process, args=(args,), daemon=True).start()
 
     # ── normal mode actions ──────────────────────────────────────────
     def _play_output(self):
@@ -309,21 +499,17 @@ class AutocutGUI(tk.Tk):
     def _run_normal(self):
         if self._running:
             return
-        self._running = True
-        self.run_btn.configure(state=tk.DISABLED, text="■ 執行中…")
-        self.run_script_btn.configure(state=tk.DISABLED)
-
         video = self.video_path.get().strip()
         if not video or not os.path.isfile(video):
             messagebox.showerror("錯誤", "請選擇有效的影片檔案")
-            self._done()
             return
 
         prompt = self.prompt_entry.get("1.0", tk.END).strip()
         if not prompt:
             messagebox.showerror("錯誤", "請輸入搜尋提示")
-            self._done()
             return
+
+        self._start_run("剪輯中…", self.run_btn)
 
         output = self.output_path.get().strip()
         if not output:
@@ -351,6 +537,7 @@ class AutocutGUI(tk.Tk):
             args.append("--verbose")
 
         self._clear_log()
+        self._last_success_message = "✓ 剪輯完成！"
         self._log(f"▶ 開始剪輯: {Path(video).name}")
         self._log(f"  Prompt: {prompt}")
         self._log(f"  Backend: {self.backend.get()}")
@@ -397,20 +584,16 @@ class AutocutGUI(tk.Tk):
     def _run_script(self):
         if self._running:
             return
-        self._running = True
-        self.run_script_btn.configure(state=tk.DISABLED, text="■ 執行中…")
-        self.run_btn.configure(state=tk.DISABLED)
-
         if not self.script_files:
             messagebox.showerror("錯誤", "請至少加入一部素材影片")
-            self._done()
             return
 
         prompt = self.script_prompt_entry.get("1.0", tk.END).strip()
         if not prompt:
             messagebox.showerror("錯誤", "請輸入腳本提示")
-            self._done()
             return
+
+        self._start_run("腳本剪輯中…", self.run_script_btn)
 
         output = self.script_output.get().strip()
         if not output:
@@ -428,6 +611,7 @@ class AutocutGUI(tk.Tk):
             args.append("--verbose")
 
         self._clear_log()
+        self._last_success_message = "✓ 腳本剪輯完成！"
         self._log(f"▶ 開始腳本剪輯: {len(self.script_files)} 部素材")
         for sf in self.script_files:
             self._log(f"    {Path(sf).name}")
@@ -439,6 +623,11 @@ class AutocutGUI(tk.Tk):
         threading.Thread(target=self._run_process, args=(args,), daemon=True).start()
 
     # ── auto script mode actions ─────────────────────────────────────
+    def _refresh_auto_listbox(self):
+        self.auto_listbox.delete(0, tk.END)
+        for f in self.auto_files:
+            self.auto_listbox.insert(tk.END, Path(f).name)
+
     def _auto_add_files(self):
         files = filedialog.askopenfilenames(
             title="選擇素材影片",
@@ -446,13 +635,17 @@ class AutocutGUI(tk.Tk):
         )
         if not files:
             return
+        changed = False
         for f in files:
             if f not in self.auto_files:
                 self.auto_files.append(f)
                 self.auto_listbox.insert(tk.END, Path(f).name)
+                changed = True
         if len(self.auto_files) == 1:
             stem = Path(self.auto_files[0]).stem
             self.auto_output.set(str(Path.home() / "Movies" / f"{stem}_auto.mp4"))
+        if changed:
+            self._save_state()
 
     def _auto_remove_selected(self):
         sel = self.auto_listbox.curselection()
@@ -461,6 +654,12 @@ class AutocutGUI(tk.Tk):
         idx = sel[0]
         self.auto_listbox.delete(idx)
         del self.auto_files[idx]
+        self._save_state()
+
+    def _auto_clear_files(self):
+        self.auto_files.clear()
+        self.auto_listbox.delete(0, tk.END)
+        self._save_state()
 
     def _auto_browse_output(self):
         f = filedialog.asksaveasfilename(
@@ -470,24 +669,22 @@ class AutocutGUI(tk.Tk):
         )
         if f:
             self.auto_output.set(f)
+            self._save_state()
 
     def _run_auto(self):
         if self._running:
             return
-        self._running = True
-        self.run_auto_btn.configure(state=tk.DISABLED, text="■ 執行中…")
-        self.run_btn.configure(state=tk.DISABLED)
-        self.run_script_btn.configure(state=tk.DISABLED)
-
         if not self.auto_files:
             messagebox.showerror("錯誤", "請至少加入一部素材影片")
-            self._done()
             return
+
+        self._start_run("一鍵腳本剪輯中…", self.run_auto_btn)
 
         output = self.auto_output.get().strip()
         if not output:
             output = str(Path.home() / "Movies" / "auto_output.mp4")
             self.auto_output.set(output)
+        self._save_state()
 
         args = [
             str(PYTHON_BIN), str(AUTOCUT_SCRIPT_SCRIPT), "create",
@@ -500,6 +697,7 @@ class AutocutGUI(tk.Tk):
             args.append("--verbose")
 
         self._clear_log()
+        self._last_success_message = "✓ 一鍵腳本剪輯完成！"
         self._log(f"▶ 一鍵腳本剪輯: {len(self.auto_files)} 部素材")
         for sf in self.auto_files:
             self._log(f"    {Path(sf).name}")
@@ -522,6 +720,46 @@ class AutocutGUI(tk.Tk):
         self.log_text.configure(state=tk.DISABLED)
         self.update_idletasks()
 
+    def _start_run(self, status_text, active_button):
+        self._running = True
+        self._stopping = False
+        self._current_proc = None
+        self._set_run_buttons_state(tk.DISABLED)
+        active_button.configure(text="■ 執行中…")
+        self.play_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
+        self.progress_label.configure(text=f"狀態：{status_text}")
+        self.progress_bar.start(12)
+
+    def _stop_process(self):
+        if not self._running:
+            return
+        self._stopping = True
+        self.stop_btn.configure(state=tk.DISABLED)
+        self.progress_label.configure(text="狀態：正在強制停止…")
+        self._log("\n⚠ 正在強制停止目前執行…")
+        proc = self._current_proc
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception as e:
+                    self._log(f"✗ 停止失敗: {e}")
+            threading.Timer(3.0, self._kill_process_if_needed, args=(proc,)).start()
+
+    def _kill_process_if_needed(self, proc):
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
     def _run_process(self, args):
         # extract output path from args (-o / --output followed by path)
         try:
@@ -531,21 +769,31 @@ class AutocutGUI(tk.Tk):
             self._last_output = None
 
         try:
-            proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
+            }
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            else:
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            proc = subprocess.Popen(args, **popen_kwargs)
+            self._current_proc = proc
+            assert proc.stdout is not None
             for line in iter(proc.stdout.readline, ""):
                 line = line.rstrip("\n\r")
                 if line:
                     self.after(0, self._log, line)
             proc.wait()
-            if proc.returncode == 0:
+            if self._stopping:
+                self.after(0, self._log, "■ 已強制停止")
+            elif proc.returncode == 0:
                 self.after(0, self._log, "")
-                self.after(0, self._log, "✓ 剪輯完成！")
+                self.after(0, self._log, self._last_success_message)
+                self.after(0, self._play_completion_sound)
                 if self._last_output and os.path.isfile(self._last_output):
                     self.after(0, lambda: self.play_btn.configure(state=tk.NORMAL))
             else:
@@ -555,11 +803,46 @@ class AutocutGUI(tk.Tk):
         finally:
             self.after(0, self._done)
 
+    def _set_run_buttons_state(self, state):
+        self.run_index_btn.configure(state=state)
+        self.run_btn.configure(state=state)
+        self.run_script_btn.configure(state=state)
+        self.run_auto_btn.configure(state=state)
+
+    def _play_completion_sound(self):
+        """Play a short notification sound when a job completes successfully."""
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(
+                    ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif os.name == "nt":
+                import winsound
+
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            else:
+                self.bell()
+        except Exception:
+            try:
+                self.bell()
+            except Exception:
+                pass
+
     def _done(self, *_):
+        stopped = self._stopping
         self._running = False
-        self.run_btn.configure(state=tk.NORMAL, text="▶ 開始剪輯")
-        self.run_script_btn.configure(state=tk.NORMAL, text="▶ 開始腳本剪輯")
-        self.run_auto_btn.configure(state=tk.NORMAL, text="▶ 一鍵腳本剪輯")
+        self._stopping = False
+        self._current_proc = None
+        self.progress_bar.stop()
+        self.progress_label.configure(text="狀態：已停止" if stopped else "狀態：待命")
+        self.stop_btn.configure(state=tk.DISABLED)
+        self._set_run_buttons_state(tk.NORMAL)
+        self.run_index_btn.configure(text="▶ 開始索引素材")
+        self.run_btn.configure(text="▶ 開始剪輯")
+        self.run_script_btn.configure(text="▶ 開始腳本剪輯")
+        self.run_auto_btn.configure(text="▶ 一鍵腳本剪輯")
 
 
 if __name__ == "__main__":

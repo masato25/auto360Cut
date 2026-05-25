@@ -380,6 +380,13 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
         removed = store.remove_file(video_path)
         if removed:
             click.echo(f"Removed {removed} existing chunk(s) for reindex.", err=True)
+    elif store.is_indexed(video_path):
+        click.echo(
+            f"Already indexed, skipping: {os.path.basename(video_path)} "
+            "(use --force-reindex to rebuild).",
+            err=True,
+        )
+        return
 
     chunks = chunk_video(video_path, chunk_duration=30, overlap=5)
     new_chunks = 0
