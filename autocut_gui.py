@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog, messagebox
 
 AUTOCUT_SCRIPT = Path(__file__).parent / "autocut.py"
 AUTOCUT_SCRIPT_SCRIPT = Path(__file__).parent / "autocut_script.py"
+ADD_DATE_SCRIPT = Path(__file__).parent / "scripts" / "add_date_to_name.py"
 PYTHON_BIN = Path(__file__).parent / ".venv" / "bin" / "python"
 GUI_STATE_FILE = Path.home() / ".autocut_gui_state.json"
 
@@ -71,6 +72,12 @@ class AutocutGUI(tk.Tk):
         self.auto_verbose = tk.BooleanVar(value=False)
         self.auto_output = tk.StringVar()
 
+        # date restore mode
+        self.date_files: list[str] = []
+        self.date_dry_run = tk.BooleanVar(value=True)
+        self.date_recursive = tk.BooleanVar(value=False)
+        self.date_force = tk.BooleanVar(value=False)
+
     def _build_ui(self):
         main = ttk.Frame(self, padding=16)
         main.pack(fill=tk.BOTH, expand=True)
@@ -92,6 +99,10 @@ class AutocutGUI(tk.Tk):
         auto_tab = ttk.Frame(notebook)
         notebook.add(auto_tab, text="一鍵腳本")
         self._build_auto_tab(auto_tab)
+
+        date_tab = ttk.Frame(notebook)
+        notebook.add(date_tab, text="日期還原")
+        self._build_date_tab(date_tab)
 
         notebook.pack(fill=tk.X, pady=(0, 10))
 
@@ -707,6 +718,117 @@ class AutocutGUI(tk.Tk):
 
         threading.Thread(target=self._run_process, args=(args,), daemon=True).start()
 
+    # ── date restore tab ─────────────────────────────────────────────
+    def _build_date_tab(self, parent):
+        vl = ttk.Frame(parent)
+        vl.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(vl, text="從影片 / 圖片的嵌入式 metadata 還原日期，附加到檔名",
+                  font=("", 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(vl, text="來源：EXIF (JPEG)、ffprobe creation_time (MP4/MOV)、檔名日期、檔案出生時間",
+                  font=("", 9), foreground="gray").pack(anchor=tk.W)
+
+        lrow = ttk.Frame(vl)
+        lrow.pack(fill=tk.X, pady=(4, 0))
+        self.date_listbox = tk.Listbox(lrow, height=6, font=("Menlo", 10))
+        self.date_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        btn_frame = ttk.Frame(lrow)
+        btn_frame.pack(side=tk.RIGHT, padx=(6, 0), fill=tk.Y)
+        ttk.Button(btn_frame, text="新增檔案…", command=self._date_add_files).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="新增資料夾…", command=self._date_add_dir).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="移除選取", command=self._date_remove_selected).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="清空", command=self._date_clear_files).pack()
+
+        opts = ttk.Frame(parent)
+        opts.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(opts, text="僅預覽 (不實際改名)", variable=self.date_dry_run).grid(row=0, column=0, sticky=tk.W, padx=(0, 12))
+        ttk.Checkbutton(opts, text="遞迴處理子資料夾", variable=self.date_recursive).grid(row=0, column=1, sticky=tk.W, padx=(0, 12))
+        ttk.Checkbutton(opts, text="強制處理 (跳過已有日期尾綴的檔案)", variable=self.date_force).grid(row=0, column=2, sticky=tk.W)
+
+        hint = ttk.Label(
+            parent,
+            text="提示：建議先用「僅預覽」模式確認結果無誤，再取消勾選進行實際改名。",
+            foreground="gray",
+            wraplength=620,
+        )
+        hint.pack(fill=tk.X, pady=(0, 6))
+
+        self.run_date_btn = ttk.Button(parent, text="▶ 執行日期還原", command=self._run_date)
+        self.run_date_btn.pack(pady=(6, 0))
+
+    def _date_add_files(self):
+        files = filedialog.askopenfilenames(
+            title="選擇媒體檔案",
+            filetypes=[
+                ("媒體檔案", "*.mp4 *.mov *.m4v *.avi *.mkv *.webm *.ts *.mts *.m2ts *.lrv *.jpg *.jpeg *.png *.heic *.heif *.webp *.tiff *.tif"),
+                ("所有檔案", "*.*"),
+            ]
+        )
+        if not files:
+            return
+        for f in files:
+            if f not in self.date_files:
+                self.date_files.append(f)
+                self.date_listbox.insert(tk.END, Path(f).name)
+
+    def _date_add_dir(self):
+        d = filedialog.askdirectory(title="選擇資料夾")
+        if not d:
+            return
+        # don't add the directory itself, just list files inside
+        path = Path(d)
+        files_added = 0
+        for f in sorted(path.iterdir()):
+            if f.is_file() and str(f) not in self.date_files:
+                self.date_files.append(str(f))
+                self.date_listbox.insert(tk.END, f.name)
+                files_added += 1
+        if files_added == 0:
+            messagebox.showinfo("提示", "資料夾內沒有找到可加入的檔案")
+
+    def _date_remove_selected(self):
+        sel = self.date_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self.date_listbox.delete(idx)
+        del self.date_files[idx]
+
+    def _date_clear_files(self):
+        self.date_files.clear()
+        self.date_listbox.delete(0, tk.END)
+
+    def _run_date(self):
+        if self._running:
+            return
+        if not self.date_files:
+            messagebox.showerror("錯誤", "請至少加入一個檔案或資料夾")
+            return
+
+        self._start_run("日期還原中…", self.run_date_btn)
+
+        args = [
+            str(PYTHON_BIN), str(ADD_DATE_SCRIPT),
+            *self.date_files,
+        ]
+        if self.date_dry_run.get():
+            args.append("--dry-run")
+        if self.date_recursive.get():
+            args.append("--recursive")
+        if self.date_force.get():
+            args.append("--force")
+
+        self._clear_log()
+        self._last_success_message = "✓ 日期還原完成！"
+        self._log(f"▶ 開始日期還原: {len(self.date_files)} 個路徑")
+        for f in self.date_files:
+            self._log(f"    {Path(f).name}")
+        self._log(f"  Dry-run: {'yes' if self.date_dry_run.get() else 'no'}")
+        self._log(f"  Recursive: {'yes' if self.date_recursive.get() else 'no'}")
+        self._log(f"  Force: {'yes' if self.date_force.get() else 'no'}")
+        self._log("")
+
+        threading.Thread(target=self._run_process, args=(args,), daemon=True).start()
+
     # ── shared process runner ────────────────────────────────────────
     def _clear_log(self):
         self.log_text.configure(state=tk.NORMAL)
@@ -808,6 +930,7 @@ class AutocutGUI(tk.Tk):
         self.run_btn.configure(state=state)
         self.run_script_btn.configure(state=state)
         self.run_auto_btn.configure(state=state)
+        self.run_date_btn.configure(state=state)
 
     def _play_completion_sound(self):
         """Play a short notification sound when a job completes successfully."""
@@ -843,6 +966,7 @@ class AutocutGUI(tk.Tk):
         self.run_btn.configure(text="▶ 開始剪輯")
         self.run_script_btn.configure(text="▶ 開始腳本剪輯")
         self.run_auto_btn.configure(text="▶ 一鍵腳本剪輯")
+        self.run_date_btn.configure(text="▶ 執行日期還原")
 
 
 if __name__ == "__main__":
