@@ -46,6 +46,14 @@ from sentrysearch.search import search_footage  # noqa: E402
 from sentrysearch.store import SentryStore  # noqa: E402
 from sentrysearch.trimmer import trim_clip  # noqa: E402
 
+from enhancement import (  # noqa: E402
+    ENHANCE_PRESETS,
+    apply_enhancement,
+    build_enhance_plan,
+    get_enhance_settings,
+    write_enhance_plan,
+)
+
 load_dotenv(ROOT / ".env")
 
 
@@ -125,8 +133,16 @@ def cli() -> None:
               help="Directory containing matching HQ source files (auto-mapped by timestamp).")
 @click.option("--360/--no-360", "is_360", default=None,
               help="Treat video as 360-degree video. Auto-detected when omitted.")
+@click.option("--face", default=None,
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Reference face photo. Focus on clips containing this person.")
 @click.option("--force-reindex", is_flag=True,
               help="Re-index this video so changed viewport prompts take effect.")
+@click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
+              help="Apply a final preset-based video/audio enhancement pass.")
+@click.option("--enhance-plan", default=None,
+              type=click.Path(dir_okay=False, path_type=Path),
+              help="Write enhancement plan JSON here. Defaults to OUTPUT.enhance-plan.json when --enhance is used.")
 @click.option("--verbose", is_flag=True, help="Show debug info.")
 def autocut_command(
     video: Path,
@@ -142,7 +158,10 @@ def autocut_command(
     hq_source: Path | None,
     hq_dir: Path | None,
     is_360: bool | None,
+    face: Path | None,
     force_reindex: bool,
+    enhance: str,
+    enhance_plan: Path | None,
     verbose: bool,
 ) -> None:
     """Project-specific autocut flow built on top of upstream sentrysearch."""
@@ -199,6 +218,10 @@ def autocut_command(
         quantize=quantize,
         verbose=verbose,
     )
+
+    if face is not None:
+        selected = _rerank_by_face(selected, face)
+
     _render_autocut(
         selected,
         source_video=video_path,
@@ -208,6 +231,8 @@ def autocut_command(
         view=view,
         yaw=yaw,
         detected_projection=projection,
+        enhance=enhance,
+        enhance_plan_path=str(enhance_plan.expanduser().resolve()) if enhance_plan else None,
     )
 
 
@@ -224,6 +249,61 @@ def upstream(ctx: click.Context) -> None:
 def _fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
+
+
+def _rerank_by_face(selected: list[dict], face: Path) -> list[dict]:
+    """Stable face-based re-ranking.
+
+    Keep the normal semantic-search result unchanged when no selected clip has
+    usable face metadata.  This prevents `--face` from changing the output just
+    because face data was missing or from sorting every clip with an equal 0.0
+    score.
+    """
+    click.echo(f"Re-ranking by face similarity: {face}", err=True)
+    try:
+        from sentrysearch.face_utils import deserialize_encodings, encode_reference_face, face_similarity
+        import json
+    except ImportError as exc:
+        click.echo(f"  face_recognition not available: {exc}", err=True)
+        click.echo("  Install: pip install face_recognition", err=True)
+        return selected
+
+    ref_enc = encode_reference_face(str(face.resolve()))
+    if ref_enc is None:
+        click.echo("  No face detected in reference image. Keeping original clip order.", err=True)
+        return selected
+
+    scored: list[tuple[int, dict, float]] = []
+    positive_scores = 0
+    for idx, s in enumerate(selected):
+        raw = s.get("face_encodings", "")
+        if not raw:
+            scored.append((idx, s, 0.0))
+            continue
+        try:
+            stored = deserialize_encodings(json.loads(raw))
+        except Exception:
+            scored.append((idx, s, 0.0))
+            continue
+        best_score = max((face_similarity(ref_enc, stored_f) for stored_f in stored), default=0.0)
+        if best_score > 0.0:
+            positive_scores += 1
+        scored.append((idx, s, best_score))
+
+    if positive_scores == 0:
+        click.echo("  No usable face matches in selected clips. Keeping original clip order.", err=True)
+        return selected
+
+    scored.sort(key=lambda x: (-x[2], x[0]))
+    click.echo(f"  Face re-ranking applied (best score: {scored[0][2]:.3f})", err=True)
+    for _idx, s, score in scored:
+        click.echo(
+            f"    face_score={score:.3f}  "
+            f"[{_fmt_time(s['start_time'])}-{_fmt_time(s['end_time'])}] "
+            f"{s.get('caption', '')[:60]}",
+            err=True,
+        )
+    return [s for _idx, s, _score in scored]
 
 
 def _resolve_hq_source(video_path: str, hq_source: str | None, hq_dir: str | None) -> str | None:
@@ -317,11 +397,19 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
         removed = store.remove_file(video_path)
         if removed:
             click.echo(f"Removed {removed} existing chunk(s) for reindex.", err=True)
+    elif store.is_indexed(video_path):
+        click.echo(
+            f"Already indexed, skipping: {os.path.basename(video_path)} "
+            "(use --force-reindex to rebuild).",
+            err=True,
+        )
+        return
 
     chunks = chunk_video(video_path, chunk_duration=30, overlap=5)
     new_chunks = 0
     rebuilt_chunks = 0
     skipped_chunks = 0
+    to_index: list[tuple[dict, str]] = []
     for chunk in chunks:
         chunk_id = store.make_chunk_id(video_path, chunk["start_time"])
         existing_meta = _get_chunk_metadata(store, chunk_id)
@@ -344,40 +432,128 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
             store.collection.delete(ids=[chunk_id])
             rebuilt_chunks += 1
 
-        click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
-        if is_360:
-            vec, meta = _embed_360_chunk(
+        to_index.append((chunk, chunk_id))
+
+    if is_360 and to_index:
+        # ── 360: two-pass — caption all viewports first, then select with context ──
+        all_view_data: list[dict] = []
+        for chunk, _ in to_index:
+            click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
+            view_data = _caption_all_360_views(
                 embedder=embedder,
                 chunk_path=chunk["chunk_path"],
                 projection=projection or "equirect",
-                viewport_prompt=viewport_prompt,
                 verbose=verbose,
             )
-        else:
+            all_view_data.append(view_data)
+
+        # Pre-compute each chunk's prompt-best caption for neighbor context
+        context_captions: list[str] = []
+        for view_data in all_view_data:
+            best_view = _choose_best_360_view(embedder, view_data["captions"], viewport_prompt, verbose)
+            context_captions.append(view_data["captions"].get(best_view, ""))
+
+        for i, ((chunk, chunk_id), view_data) in enumerate(zip(to_index, all_view_data)):
+            prev_caption = context_captions[i - 1] if i > 0 else None
+            next_caption = context_captions[i + 1] if i < len(context_captions) - 1 else None
+            best_view = _select_best_360_view_with_context(
+                embedder, viewport_prompt,
+                view_data["captions"], view_data["vectors"],
+                prev_caption, next_caption,
+                sharpness=view_data.get("sharpness"),
+                verbose=verbose,
+            )
+            best_vec = view_data["vectors"].get(best_view)
+            if best_vec is None:
+                for view in VIEW_CHOICES:
+                    if view in view_data["vectors"]:
+                        best_view = view
+                        best_vec = view_data["vectors"][view]
+                        break
+            if best_vec is None:
+                continue
+
+            combined_caption = "; ".join(
+                f"{view}: {caption}" for view, caption in view_data["captions"].items() if caption
+            )
+            best_caption = view_data["captions"].get(best_view, "")
+            all_faces: list[list[float]] = []
+            for view in VIEW_CHOICES:
+                all_faces.extend(view_data["face_encodings"].get(view, []))
+
+            meta = {
+                "caption": best_caption or combined_caption,
+                "is_360": True,
+                "best_yaw": VIEW_TO_YAW[best_view],
+                "best_direction": best_view,
+                "projection": projection or "equirect",
+                "viewport_prompt": viewport_prompt,
+                "viewport_index_version": VIEWPORT_INDEX_VERSION,
+                "viewport_captions": combined_caption,
+            }
+            if all_faces:
+                import json
+                meta["face_encodings"] = json.dumps(all_faces)
+
+            chunk_meta = {
+                "source_file": video_path,
+                "start_time": chunk["start_time"],
+                "end_time": chunk["end_time"],
+                "caption": meta.get("caption", ""),
+                "is_360": True,
+                "best_yaw": meta.get("best_yaw", 0),
+                "best_direction": meta.get("best_direction", ""),
+                "projection": projection or meta.get("projection", "equirect"),
+                "viewport_prompt": meta.get("viewport_prompt", ""),
+                "viewport_index_version": meta.get("viewport_index_version", 0),
+                "viewport_captions": meta.get("viewport_captions", ""),
+            }
+            face_enc = meta.get("face_encodings")
+            if face_enc:
+                chunk_meta["face_encodings"] = face_enc
+            store.add_chunk(chunk_id, best_vec, chunk_meta)
+            new_chunks += 1
+            try:
+                os.unlink(chunk["chunk_path"])
+            except OSError:
+                pass
+
+    elif to_index:
+        # ── non-360: embed directly ──
+        for chunk, chunk_id in to_index:
+            click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
             meta = {}
             vec = embedder.embed_video_chunk(chunk["chunk_path"], metadata=meta, verbose=verbose)
-        if vec is None:
-            continue
+            if not is_360:
+                faces = _detect_faces_in_viewport(chunk["chunk_path"], verbose)
+                if faces:
+                    import json
+                    meta["face_encodings"] = json.dumps(faces)
+            if vec is None:
+                continue
 
-        chunk_meta = {
-            "source_file": video_path,
-            "start_time": chunk["start_time"],
-            "end_time": chunk["end_time"],
-            "caption": meta.get("caption", ""),
-            "is_360": is_360 or meta.get("is_360", False),
-            "best_yaw": meta.get("best_yaw", 0),
-            "best_direction": meta.get("best_direction", ""),
-            "projection": projection or meta.get("projection", "equirect"),
-            "viewport_prompt": meta.get("viewport_prompt", ""),
-            "viewport_index_version": meta.get("viewport_index_version", 0),
-            "viewport_captions": meta.get("viewport_captions", ""),
-        }
-        store.add_chunk(chunk_id, vec, chunk_meta)
-        new_chunks += 1
-        try:
-            os.unlink(chunk["chunk_path"])
-        except OSError:
-            pass
+            chunk_meta = {
+                "source_file": video_path,
+                "start_time": chunk["start_time"],
+                "end_time": chunk["end_time"],
+                "caption": meta.get("caption", ""),
+                "is_360": False,
+                "best_yaw": 0,
+                "best_direction": "",
+                "projection": "",
+                "viewport_prompt": "",
+                "viewport_index_version": 0,
+                "viewport_captions": "",
+            }
+            face_enc = meta.get("face_encodings")
+            if face_enc:
+                chunk_meta["face_encodings"] = face_enc
+            store.add_chunk(chunk_id, vec, chunk_meta)
+            new_chunks += 1
+            try:
+                os.unlink(chunk["chunk_path"])
+            except OSError:
+                pass
 
     if chunks:
         shutil.rmtree(os.path.dirname(chunks[0]["chunk_path"]), ignore_errors=True)
@@ -396,12 +572,73 @@ def _is_360_cache_current(meta: dict, viewport_prompt: str, projection: str | No
     )
 
 
-def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
-                     viewport_prompt: str, verbose: bool) -> tuple[list[float] | None, dict]:
-    """Embed a 360 chunk by captioning four flat viewports and selecting best yaw."""
-    captions_by_view: dict[str, str] = {}
-    tmp_paths: list[str] = []
+def _detect_faces_in_viewport(viewport_path: str, verbose: bool) -> list[list[float]]:
+    encodings: list[list[float]] = []
+    try:
+        from sentrysearch.face_utils import extract_frame, encode_face_array
+        frame = extract_frame(viewport_path, time_sec=0.0)
+        if frame is not None:
+            face_vecs = encode_face_array(frame)
+            if face_vecs and verbose:
+                click.echo(f"    [face] detected {len(face_vecs)} face(s)", err=True)
+            encodings = [v.tolist() for v in face_vecs]
+    except Exception:
+        if verbose:
+            click.echo("    [face] detection skipped", err=True)
+    return encodings
+
+
+_face_recording_available = True
+
+
+def _compute_sharpness(viewport_path: str) -> float:
+    """Laplacian variance; higher = sharper. Returns 0 on failure.
+
+    Keep this dependency-light: OpenCV is not required by autoCut's local-api
+    install path, so compute the Laplacian with NumPy instead of cv2.
+    """
+    try:
+        from sentrysearch.face_utils import extract_frame
+        import numpy as np
+
+        frame = extract_frame(viewport_path, time_sec=0.0)
+        if frame is None:
+            return 0.0
+
+        arr = np.asarray(frame, dtype=np.float64)
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        elif arr.ndim == 2:
+            gray = arr
+        else:
+            return 0.0
+
+        if gray.shape[0] < 3 or gray.shape[1] < 3:
+            return 0.0
+
+        lap = (
+            gray[:-2, 1:-1]
+            + gray[2:, 1:-1]
+            + gray[1:-1, :-2]
+            + gray[1:-1, 2:]
+            - 4.0 * gray[1:-1, 1:-1]
+        )
+        return float(lap.var())
+    except Exception:
+        return 0.0
+
+
+def _caption_all_360_views(*, embedder, chunk_path: str, projection: str,
+                           verbose: bool) -> dict:
+    """Render and caption all 4 viewports of a 360 chunk.
+
+    Returns dict with keys: captions, vectors, face_encodings, sharpness
+    """
+    captions: dict[str, str] = {}
     vectors: dict[str, list[float]] = {}
+    face_encodings: dict[str, list[list[float]]] = {}
+    sharpness: dict[str, float] = {}
+    tmp_paths: list[str] = []
     try:
         for view, yaw in VIEW_TO_YAW.items():
             fd, viewport_path = tempfile.mkstemp(suffix=f"_{view}.mp4")
@@ -411,38 +648,19 @@ def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
             view_meta: dict = {}
             vec = embedder.embed_video_chunk(viewport_path, metadata=view_meta, verbose=verbose)
             caption = (view_meta.get("caption") or "").strip()
-            captions_by_view[view] = caption
+            captions[view] = caption
             if vec is not None:
                 vectors[view] = vec
             if verbose:
                 click.echo(f"    [360] {view} yaw={yaw}: {caption[:90]}", err=True)
-
-        best_view = _choose_best_360_view(embedder, captions_by_view, viewport_prompt, verbose)
-        best_vec = vectors.get(best_view)
-        if best_vec is None:
-            for view in VIEW_CHOICES:
-                if view in vectors:
-                    best_view = view
-                    best_vec = vectors[view]
-                    break
-        if best_vec is None:
-            return None, {}
-
-        combined_caption = "; ".join(
-            f"{view}: {caption}" for view, caption in captions_by_view.items() if caption
-        )
-        best_caption = captions_by_view.get(best_view, "")
-        meta = {
-            "caption": best_caption or combined_caption,
-            "is_360": True,
-            "best_yaw": VIEW_TO_YAW[best_view],
-            "best_direction": best_view,
-            "projection": projection,
-            "viewport_prompt": viewport_prompt,
-            "viewport_index_version": VIEWPORT_INDEX_VERSION,
-            "viewport_captions": combined_caption,
+            faces = _detect_faces_in_viewport(viewport_path, verbose)
+            if faces:
+                face_encodings[view] = faces
+            sharpness[view] = _compute_sharpness(viewport_path)
+        return {
+            "captions": captions, "vectors": vectors,
+            "face_encodings": face_encodings, "sharpness": sharpness,
         }
-        return best_vec, meta
     finally:
         for path in tmp_paths:
             try:
@@ -452,6 +670,7 @@ def _embed_360_chunk(*, embedder, chunk_path: str, projection: str,
 
 
 def _choose_best_360_view(embedder, captions_by_view: dict[str, str], prompt: str, verbose: bool) -> str:
+    """Select best viewport by prompt similarity alone (no context)."""
     query_vec = embedder.embed_query(prompt, verbose=verbose)
     best_view = "front"
     best_score = float("-inf")
@@ -460,11 +679,66 @@ def _choose_best_360_view(embedder, captions_by_view: dict[str, str], prompt: st
             continue
         caption_vec = embedder.embed_query(caption, verbose=False)
         score = _cosine_similarity(query_vec, caption_vec)
-        if verbose:
-            click.echo(f"    [360] match {view}: {score:.4f}", err=True)
         if score > best_score:
             best_score = score
             best_view = view
+    return best_view
+
+
+def _select_best_360_view_with_context(
+    embedder, viewport_prompt: str,
+    captions_by_view: dict[str, str],
+    vectors: dict[str, list[float]],
+    prev_caption: str | None,
+    next_caption: str | None,
+    sharpness: dict[str, float] | None,
+    verbose: bool,
+) -> str:
+    """Select best viewport using prompt + context + sharpness."""
+    query_vec = embedder.embed_query(viewport_prompt, verbose=verbose)
+    best_view = "front"
+    best_score = float("-inf")
+    scores: list[tuple[str, float | None]] = []
+
+    # Min-max normalize sharpness across views
+    sharp_norm: dict[str, float] = {}
+    if sharpness:
+        sv = [s for s in sharpness.values() if s > 0]
+        if sv:
+            mn, mx = min(sv), max(sv)
+            for v in sharpness:
+                sharp_norm[v] = (sharpness[v] - mn) / (mx - mn + 1e-8)
+
+    for view, caption in captions_by_view.items():
+        if not caption:
+            scores.append((view, None))
+            continue
+        caption_vec = embedder.embed_query(caption, verbose=False)
+        prompt_score = _cosine_similarity(query_vec, caption_vec)
+
+        context_bonus = 0.0
+        if prev_caption:
+            prev_vec = embedder.embed_query(prev_caption, verbose=False)
+            context_bonus += 0.15 * _cosine_similarity(caption_vec, prev_vec)
+        if next_caption:
+            next_vec = embedder.embed_query(next_caption, verbose=False)
+            context_bonus += 0.15 * _cosine_similarity(caption_vec, next_vec)
+
+        sharp_bonus = 0.08 * sharp_norm.get(view, 0.0)
+        score = prompt_score + context_bonus + sharp_bonus
+        scores.append((view, score))
+        if score > best_score:
+            best_score = score
+            best_view = view
+
+    click.echo("    [360] viewport scores:", err=True)
+    for view, score in scores:
+        marker = " ← selected" if view == best_view and score is not None else ""
+        if score is None:
+            click.echo(f"      {view:>5}: no caption", err=True)
+        else:
+            s = sharpness.get(view, 0) if sharpness else 0
+            click.echo(f"      {view:>5}: {score:.4f} (sharp={s:.0f}){marker}", err=True)
     return best_view
 
 
@@ -527,6 +801,7 @@ def _load_rows(video_path: str, *, backend: str, model: str | None) -> list[dict
                 "best_yaw": meta.get("best_yaw", 0),
                 "best_direction": meta.get("best_direction", ""),
                 "projection": meta.get("projection", "equirect"),
+                "face_encodings": meta.get("face_encodings", ""),
             })
     rows.sort(key=lambda r: r["start_time"])
     return rows
@@ -592,10 +867,14 @@ def _select_clips(rows: list[dict], *, prompt: str, count: int,
 
 def _render_autocut(selected: list[dict], *, source_video: str, output_path: str,
                     hq_source: str | None, hq_dir: str | None, view: str,
-                    yaw: float | None, detected_projection: str | None) -> None:
+                    yaw: float | None, detected_projection: str | None,
+                    enhance: str = "none", enhance_plan_path: str | None = None) -> None:
     trim_source = _resolve_hq_source(source_video, hq_source, hq_dir)
     if trim_source:
         click.echo(f"Using HQ trim source: {trim_source}")
+    enhance_settings = get_enhance_settings(enhance)
+    if enhance_settings.preset != "none":
+        click.echo(f"Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
 
     output_dir = os.path.dirname(output_path) or "."
     os.makedirs(output_dir, exist_ok=True)
@@ -664,6 +943,19 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
+
+        if enhance_settings.preset != "none":
+            plan = build_enhance_plan(
+                preset=enhance_settings.preset,
+                input_path=output_path,
+                output_path=output_path,
+                context="autocut",
+                extra={"clip_count": len(selected)},
+            )
+            plan_path = write_enhance_plan(plan, enhance_plan_path)
+            click.echo(f"Enhancement plan: {plan_path}")
+            click.echo("Applying enhancement pass...")
+            apply_enhancement(ffmpeg, output_path, output_path, preset=enhance_settings.preset)
         click.secho(f"\n✓ Auto-cut complete: {output_path}", fg="green", bold=True)
     finally:
         for cf in clip_files:

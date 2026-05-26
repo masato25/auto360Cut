@@ -37,6 +37,9 @@ local-api = [
 qwen-cloud = [
     "dashscope>=1.25.17",
 ]
+face = [
+    "face_recognition",
+]
 
 [project.scripts]
 sentrysearch = "sentrysearch.cli:cli"
