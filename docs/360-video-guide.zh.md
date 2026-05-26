@@ -148,11 +148,24 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-local-api.txt
 ```
 
-安裝項目：
-- `openai`（OpenAI 相容 API 客戶端）
-- `chromadb`（向量資料庫）
+依賴透過 `sentrysearch` submodule 管理，依安裝的 extras 決定：
+
+**核心依賴**（`sentrysearch` 核心，一定會裝）：
 - `click`（CLI 框架）
 - `python-dotenv`（環境變數管理）
+- `chromadb`（向量資料庫）
+- `google-genai`（Gemini 嵌入 backend）
+- `imageio-ffmpeg`（影片幀提取）
+- `protobuf`（序列化）
+
+**Local API 模式**（`requirements-local-api.txt` 額外安裝）：
+- `openai`（OpenAI 相容 API 客戶端）
+
+**Qwen Cloud 模式**（`requirements-qwen-cloud.txt` 額外安裝）：
+- `dashscope`（阿里雲 DashScope SDK）
+
+**Local 模式**（直接在地端推理）：
+- `torch`、`torchvision`、`transformers`、`accelerate`、`qwen-vl-utils`、`torchcodec`
 
 ---
 

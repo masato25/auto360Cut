@@ -14,7 +14,7 @@ auto360Cut 是一個用來把 360 / 一般影片做「語意搜尋」與「自�
 ## 人臉辨識（選用）
 
 ```bash
-.venv/bin/python -m pip install face_recognition
+.venv/bin/python -m pip install -e "./sentrysearch[face]"
 ```
 
 索引時自動偵測各視角的人臉。搜尋時加 `--face ref.jpg` 就會把有該主角的片段排在前面。
@@ -263,17 +263,23 @@ Script Mode 也支援同樣參數：
 ### `--yaw`
 直接指定最後輸出使用的 yaw 角度；若有設定，優先權高於 `--view`。
 
-## 安裝檔說明
+## 依賴管理
 
-- `requirements.txt`
-  - auto360Cut root venv 的基礎安裝需求
-  - 包含 pip 常用建置工具與最基本啟動依賴
-- `requirements-local-api.txt`
-  - 建議使用自架 llama.cpp / llmcpp / OpenAI 相容 HTTP API 的工作流使用
-  - 會直接安裝 `./sentrysearch[local-api]`
-- `requirements-qwen-cloud.txt`
-  - 只有真的要走 qwen-cloud 時才需要
-  - 會直接安裝 `./sentrysearch[qwen-cloud]`
+依賴由 `sentrysearch` submodule 的 `pyproject.toml` 管理，分為核心與 extras：
+
+| 檔案 | 內容 |
+|------|------|
+| `requirements.txt` | root venv 基礎（`click`, `python-dotenv`, `setuptools`, `wheel`） |
+| `requirements-local-api.txt` | `-r requirements.txt` + `./sentrysearch[local-api]`（含 `openai`） |
+| `requirements-qwen-cloud.txt` | `-r requirements.txt` + `./sentrysearch[qwen-cloud]`（含 `dashscope`） |
+
+其他 extras 可直接安裝：
+```bash
+.venv/bin/python -m pip install -e "./sentrysearch[local]"       # 本地 GPU 推理
+.venv/bin/python -m pip install -e "./sentrysearch[local-quantized]"  # 量化推理
+.venv/bin/python -m pip install -e "./sentrysearch[face]"        # 人臉辨識
+.venv/bin/python -m pip install -e "./sentrysearch[tesla]"       # Tesla 地理資訊
+```
 
 ## 文件
 
