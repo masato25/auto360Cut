@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -53,6 +54,7 @@ from enhancement import (  # noqa: E402
     get_enhance_settings,
     write_enhance_plan,
 )
+from utils import fmt_time as _fmt_time, resolve_hq_source  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
@@ -246,11 +248,6 @@ def upstream(ctx: click.Context) -> None:
     upstream_cli(prog_name="autocut")
 
 
-def _fmt_time(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02d}:{s:02d}"
-
-
 def _rerank_by_face(selected: list[dict], face: Path) -> list[dict]:
     """Stable face-based re-ranking.
 
@@ -306,45 +303,6 @@ def _rerank_by_face(selected: list[dict], face: Path) -> list[dict]:
     return [s for _idx, s, _score in scored]
 
 
-def _resolve_hq_source(video_path: str, hq_source: str | None, hq_dir: str | None) -> str | None:
-    if hq_source:
-        return os.path.abspath(os.path.expanduser(hq_source))
-    if not hq_dir:
-        return None
-
-    directory = os.path.abspath(os.path.expanduser(hq_dir))
-    base = os.path.basename(video_path)
-    timestamp_match = re.search(r"(\d{8}_\d{6})", base)
-    timestamp = timestamp_match.group(1) if timestamp_match else None
-    seq_match = re.search(r"_(\d{3})(?:\.[^.]+)?$", base)
-    seq = seq_match.group(1) if seq_match else None
-
-    candidates = []
-    if timestamp and seq:
-        candidates += [
-            f"VID_{timestamp}_00_{seq}.mp4",
-            f"VID_{timestamp}_00_{seq}.mov",
-            f"VID_{timestamp}_{seq}.mp4",
-            f"VID_{timestamp}_{seq}.mov",
-        ]
-    if timestamp:
-        candidates += [f"VID_{timestamp}.mp4", f"VID_{timestamp}.mov"]
-
-    for name in candidates:
-        candidate = os.path.join(directory, name)
-        if os.path.isfile(candidate):
-            return candidate
-
-    if timestamp:
-        for entry in sorted(os.listdir(directory)):
-            if entry.startswith(f"VID_{timestamp}") and entry.lower().endswith((".mp4", ".mov", ".m4v")):
-                return os.path.join(directory, entry)
-
-    raise FileNotFoundError(
-        f"Could not find HQ source for {video_path} in {directory}. Pass --hq-source explicitly."
-    )
-
-
 def _validate_backend_options(backend: str, model: str | None, dashscope_model: str | None) -> None:
     if model is not None and dashscope_model is not None:
         raise click.UsageError("Use only one of --model or --dashscope-model, not both.")
@@ -373,13 +331,10 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
     click.echo("Indexing video...")
     reset_embedder()
     embedder_kwargs: dict = {}
+    if backend in {"local", "local-api", "qwen-cloud"}:
+        embedder_kwargs["model"] = model
     if backend == "local":
-        embedder_kwargs["model"] = model
         embedder_kwargs["quantize"] = quantize
-    elif backend == "local-api":
-        embedder_kwargs["model"] = model
-    elif backend == "qwen-cloud":
-        embedder_kwargs["model"] = model
     try:
         embedder = get_embedder(backend=backend, **embedder_kwargs)
     except DashScopeDependencyError as exc:
@@ -406,7 +361,6 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
         return
 
     chunks = chunk_video(video_path, chunk_duration=30, overlap=5)
-    new_chunks = 0
     rebuilt_chunks = 0
     skipped_chunks = 0
     to_index: list[tuple[dict, str]] = []
@@ -435,131 +389,148 @@ def _index_video(*, video_path: str, backend: str, model: str | None,
         to_index.append((chunk, chunk_id))
 
     if is_360 and to_index:
-        # ── 360: two-pass — caption all viewports first, then select with context ──
-        all_view_data: list[dict] = []
-        for chunk, _ in to_index:
-            click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
-            view_data = _caption_all_360_views(
-                embedder=embedder,
-                chunk_path=chunk["chunk_path"],
-                projection=projection or "equirect",
-                verbose=verbose,
-            )
-            all_view_data.append(view_data)
-
-        # Pre-compute each chunk's prompt-best caption for neighbor context
-        context_captions: list[str] = []
-        for view_data in all_view_data:
-            best_view = _choose_best_360_view(embedder, view_data["captions"], viewport_prompt, verbose)
-            context_captions.append(view_data["captions"].get(best_view, ""))
-
-        for i, ((chunk, chunk_id), view_data) in enumerate(zip(to_index, all_view_data)):
-            prev_caption = context_captions[i - 1] if i > 0 else None
-            next_caption = context_captions[i + 1] if i < len(context_captions) - 1 else None
-            best_view = _select_best_360_view_with_context(
-                embedder, viewport_prompt,
-                view_data["captions"], view_data["vectors"],
-                prev_caption, next_caption,
-                sharpness=view_data.get("sharpness"),
-                verbose=verbose,
-            )
-            best_vec = view_data["vectors"].get(best_view)
-            if best_vec is None:
-                for view in VIEW_CHOICES:
-                    if view in view_data["vectors"]:
-                        best_view = view
-                        best_vec = view_data["vectors"][view]
-                        break
-            if best_vec is None:
-                continue
-
-            combined_caption = "; ".join(
-                f"{view}: {caption}" for view, caption in view_data["captions"].items() if caption
-            )
-            best_caption = view_data["captions"].get(best_view, "")
-            all_faces: list[list[float]] = []
-            for view in VIEW_CHOICES:
-                all_faces.extend(view_data["face_encodings"].get(view, []))
-
-            meta = {
-                "caption": best_caption or combined_caption,
-                "is_360": True,
-                "best_yaw": VIEW_TO_YAW[best_view],
-                "best_direction": best_view,
-                "projection": projection or "equirect",
-                "viewport_prompt": viewport_prompt,
-                "viewport_index_version": VIEWPORT_INDEX_VERSION,
-                "viewport_captions": combined_caption,
-            }
-            if all_faces:
-                import json
-                meta["face_encodings"] = json.dumps(all_faces)
-
-            chunk_meta = {
-                "source_file": video_path,
-                "start_time": chunk["start_time"],
-                "end_time": chunk["end_time"],
-                "caption": meta.get("caption", ""),
-                "is_360": True,
-                "best_yaw": meta.get("best_yaw", 0),
-                "best_direction": meta.get("best_direction", ""),
-                "projection": projection or meta.get("projection", "equirect"),
-                "viewport_prompt": meta.get("viewport_prompt", ""),
-                "viewport_index_version": meta.get("viewport_index_version", 0),
-                "viewport_captions": meta.get("viewport_captions", ""),
-            }
-            face_enc = meta.get("face_encodings")
-            if face_enc:
-                chunk_meta["face_encodings"] = face_enc
-            store.add_chunk(chunk_id, best_vec, chunk_meta)
-            new_chunks += 1
-            try:
-                os.unlink(chunk["chunk_path"])
-            except OSError:
-                pass
-
+        new_chunks = _index_360_chunks(
+            store, video_path, to_index,
+            embedder=embedder, projection=projection,
+            viewport_prompt=viewport_prompt, verbose=verbose,
+        )
     elif to_index:
-        # ── non-360: embed directly ──
-        for chunk, chunk_id in to_index:
-            click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
-            meta = {}
-            vec = embedder.embed_video_chunk(chunk["chunk_path"], metadata=meta, verbose=verbose)
-            if not is_360:
-                faces = _detect_faces_in_viewport(chunk["chunk_path"], verbose)
-                if faces:
-                    import json
-                    meta["face_encodings"] = json.dumps(faces)
-            if vec is None:
-                continue
-
-            chunk_meta = {
-                "source_file": video_path,
-                "start_time": chunk["start_time"],
-                "end_time": chunk["end_time"],
-                "caption": meta.get("caption", ""),
-                "is_360": False,
-                "best_yaw": 0,
-                "best_direction": "",
-                "projection": "",
-                "viewport_prompt": "",
-                "viewport_index_version": 0,
-                "viewport_captions": "",
-            }
-            face_enc = meta.get("face_encodings")
-            if face_enc:
-                chunk_meta["face_encodings"] = face_enc
-            store.add_chunk(chunk_id, vec, chunk_meta)
-            new_chunks += 1
-            try:
-                os.unlink(chunk["chunk_path"])
-            except OSError:
-                pass
+        new_chunks = _index_flat_chunks(store, video_path, to_index, embedder=embedder, verbose=verbose)
+    else:
+        new_chunks = 0
 
     if chunks:
         shutil.rmtree(os.path.dirname(chunks[0]["chunk_path"]), ignore_errors=True)
     click.echo(
         f"Indexed {new_chunks} chunk(s): {rebuilt_chunks} rebuilt, {skipped_chunks} already valid."
     )
+
+
+def _index_360_chunks(
+    store: SentryStore,
+    video_path: str,
+    to_index: list[tuple[dict, str]],
+    *,
+    embedder,
+    projection: str | None,
+    viewport_prompt: str,
+    verbose: bool,
+) -> int:
+    """Two-pass 360 indexing: caption all viewports, then select best with neighbor context."""
+    all_view_data: list[dict] = []
+    for chunk, _ in to_index:
+        click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
+        view_data = _caption_all_360_views(
+            embedder=embedder,
+            chunk_path=chunk["chunk_path"],
+            projection=projection or "equirect",
+            verbose=verbose,
+        )
+        all_view_data.append(view_data)
+
+    context_captions: list[str] = []
+    for view_data in all_view_data:
+        best_view = _choose_best_360_view(embedder, view_data["captions"], viewport_prompt, verbose)
+        context_captions.append(view_data["captions"].get(best_view, ""))
+
+    new_chunks = 0
+    for i, ((chunk, chunk_id), view_data) in enumerate(zip(to_index, all_view_data)):
+        prev_caption = context_captions[i - 1] if i > 0 else None
+        next_caption = context_captions[i + 1] if i < len(context_captions) - 1 else None
+        best_view = _select_best_360_view_with_context(
+            embedder, viewport_prompt,
+            view_data["captions"], view_data["vectors"],
+            prev_caption, next_caption,
+            sharpness=view_data.get("sharpness"),
+            verbose=verbose,
+        )
+        best_vec = view_data["vectors"].get(best_view)
+        if best_vec is None:
+            for view in VIEW_CHOICES:
+                if view in view_data["vectors"]:
+                    best_view = view
+                    best_vec = view_data["vectors"][view]
+                    break
+        if best_vec is None:
+            continue
+
+        combined_caption = "; ".join(
+            f"{view}: {caption}" for view, caption in view_data["captions"].items() if caption
+        )
+        best_caption = view_data["captions"].get(best_view, "")
+        all_faces: list[list[float]] = []
+        for view in VIEW_CHOICES:
+            all_faces.extend(view_data["face_encodings"].get(view, []))
+
+        chunk_meta = {
+            "source_file": video_path,
+            "start_time": chunk["start_time"],
+            "end_time": chunk["end_time"],
+            "caption": best_caption or combined_caption,
+            "is_360": True,
+            "best_yaw": VIEW_TO_YAW[best_view],
+            "best_direction": best_view,
+            "projection": projection or "equirect",
+            "viewport_prompt": viewport_prompt,
+            "viewport_index_version": VIEWPORT_INDEX_VERSION,
+            "viewport_captions": combined_caption,
+        }
+        if all_faces:
+            chunk_meta["face_encodings"] = json.dumps(all_faces)
+        store.add_chunk(chunk_id, best_vec, chunk_meta)
+        new_chunks += 1
+        try:
+            os.unlink(chunk["chunk_path"])
+        except OSError:
+            pass
+
+    return new_chunks
+
+
+def _index_flat_chunks(
+    store: SentryStore,
+    video_path: str,
+    to_index: list[tuple[dict, str]],
+    *,
+    embedder,
+    verbose: bool,
+) -> int:
+    """Embed non-360 chunks directly."""
+    new_chunks = 0
+    for chunk, chunk_id in to_index:
+        click.echo(f"  Indexing chunk @ {_fmt_time(chunk['start_time'])}...")
+        meta: dict = {}
+        vec = embedder.embed_video_chunk(chunk["chunk_path"], metadata=meta, verbose=verbose)
+        faces = _detect_faces_in_viewport(chunk["chunk_path"], verbose)
+        if faces:
+            meta["face_encodings"] = json.dumps(faces)
+        if vec is None:
+            continue
+
+        chunk_meta = {
+            "source_file": video_path,
+            "start_time": chunk["start_time"],
+            "end_time": chunk["end_time"],
+            "caption": meta.get("caption", ""),
+            "is_360": False,
+            "best_yaw": 0,
+            "best_direction": "",
+            "projection": "",
+            "viewport_prompt": "",
+            "viewport_index_version": 0,
+            "viewport_captions": "",
+        }
+        face_enc = meta.get("face_encodings")
+        if face_enc:
+            chunk_meta["face_encodings"] = face_enc
+        store.add_chunk(chunk_id, vec, chunk_meta)
+        new_chunks += 1
+        try:
+            os.unlink(chunk["chunk_path"])
+        except OSError:
+            pass
+
+    return new_chunks
 
 
 def _is_360_cache_current(meta: dict, viewport_prompt: str, projection: str | None) -> bool:
@@ -869,7 +840,11 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
                     hq_source: str | None, hq_dir: str | None, view: str,
                     yaw: float | None, detected_projection: str | None,
                     enhance: str = "none", enhance_plan_path: str | None = None) -> None:
-    trim_source = _resolve_hq_source(source_video, hq_source, hq_dir)
+    trim_source = resolve_hq_source(source_video, hq_source=hq_source, hq_dir=hq_dir)
+    if trim_source is None and hq_dir:
+        raise FileNotFoundError(
+            f"Could not find HQ source for {source_video} in {hq_dir}. Pass --hq-source explicitly."
+        )
     if trim_source:
         click.echo(f"Using HQ trim source: {trim_source}")
     enhance_settings = get_enhance_settings(enhance)

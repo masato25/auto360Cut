@@ -32,16 +32,12 @@ from enhancement import (  # noqa: E402
     get_enhance_settings,
     write_enhance_plan,
 )
+from utils import fmt_time as _fmt_time, resolve_hq_source as _resolve_hq_source  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
 
 # ── helpers ──────────────────────────────────────────────────────────
-def _fmt_time(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    return f"{m:02d}:{s:02d}"
-
-
 def _get_ffmpeg() -> str:
     from sentrysearch.chunker import _get_ffmpeg_executable
     ff = _get_ffmpeg_executable()
@@ -56,30 +52,6 @@ def _auto_backend() -> str:
 
 def _auto_model() -> str | None:
     return os.environ.get("LOCAL_API_MODEL") or None
-
-
-def _resolve_hq_source(video_path: str, hq_dir: str | None) -> str | None:
-    if hq_dir:
-        directory = os.path.abspath(os.path.expanduser(hq_dir))
-        base = os.path.basename(video_path)
-        ts_match = re.search(r"(\d{8}_\d{6})", base)
-        if not ts_match:
-            return None
-        ts = ts_match.group(1)
-        for f in os.listdir(directory):
-            if ts in f and f.lower().endswith((".mp4", ".mov")) and not f.startswith("._"):
-                return os.path.join(directory, f)
-        return None
-    if video_path.lower().endswith(".lrv"):
-        base = os.path.basename(video_path)
-        ts_match = re.search(r"(\d{8}_\d{6})", base)
-        if not ts_match:
-            return None
-        ts = ts_match.group(1)
-        for f in sorted(os.listdir(os.path.dirname(video_path) or ".")):
-            if ts in f and f.lower().endswith((".mp4", ".mov")) and not f.startswith("._"):
-                return os.path.join(os.path.dirname(video_path) or ".", f)
-    return None
 
 
 # ── 1. index ─────────────────────────────────────────────────────────
@@ -244,34 +216,36 @@ def _check_api_tcp_connectivity(base_url: str, timeout: float = 3.0) -> tuple[bo
         return False, f"cannot connect to {host}:{port} ({exc})"
 
 
-def ask_script(
-    catalog: str,
+_HIGHLIGHT_INSTRUCTION = (
+    "\nEditing strategy: Treat this as a highlight edit, not an even summary. "
+    "Do not distribute selections evenly across files and do not keep mediocre shots just for completeness. "
+    "Review the entire catalog and select only clips with strong information value, emotion, action, facial expression, beautiful visuals, transition value, or story progression. "
+    "Avoid long, repetitive, waiting, empty, badly shaky, unclear, low-value filler, or overly similar clips. "
+    "If multiple clips show the same event, usually keep only the strongest, clearest, or most useful one for story continuity. "
+    "The final rhythm should feel like a polished highlight video: a strong opening, varied middle, and satisfying ending. "
+    "Prefer short and precise over long and loose."
+)
+
+_JSON_CONTRACT = (
+    "Return ONLY a valid JSON array. Do not wrap it in markdown and do not add explanations.\n"
+    "Each item must use this exact schema:\n"
+    "[\n"
+    '  {"source_file": "exact filename from catalog", "start_time": 0, "end_time": 30, "narration": "繁體中文段落說明"}\n'
+    "]\n"
+    "Strict rules:\n"
+    "1. source_file must exactly match a filename in the catalog, character-for-character. For example, do not change LRV_xxx.lrv to VID_xxx.lrv.\n"
+    "2. start_time and end_time must be numeric seconds taken from catalog segment boundaries. Never use HH:MM:SS or MM:SS strings.\n"
+    "3. Select from the entire catalog, not only the first few files or first few minutes.\n"
+    "4. narration must be written in Traditional Chinese.\n"
+    "5. If the material is insufficient for a meaningful edit, return []."
+)
+
+
+def _build_script_system_prompt(
+    auto_prompt: bool,
     prompt: str,
-    verbose: bool,
-    auto_prompt: bool = False,
-    *,
-    script_api_base: str | None = None,
-    script_api_key: str | None = None,
-    script_api_model: str | None = None,
-    script_api_max_tokens: int | None = None,
-    target_duration_minutes: float | None = None,
-) -> list[dict]:
-    default_api_base, default_api_key, default_model, default_max_tokens = _script_api_defaults()
-    api_base = script_api_base or default_api_base
-    api_key = script_api_key or default_api_key
-    model = script_api_model or default_model
-    max_tokens = _safe_script_max_tokens(script_api_max_tokens if script_api_max_tokens is not None else default_max_tokens)
-
-    highlight_instruction = (
-        "\nEditing strategy: Treat this as a highlight edit, not an even summary. "
-        "Do not distribute selections evenly across files and do not keep mediocre shots just for completeness. "
-        "Review the entire catalog and select only clips with strong information value, emotion, action, facial expression, beautiful visuals, transition value, or story progression. "
-        "Avoid long, repetitive, waiting, empty, badly shaky, unclear, low-value filler, or overly similar clips. "
-        "If multiple clips show the same event, usually keep only the strongest, clearest, or most useful one for story continuity. "
-        "The final rhythm should feel like a polished highlight video: a strong opening, varied middle, and satisfying ending. "
-        "Prefer short and precise over long and loose."
-    )
-
+    target_duration_minutes: float | None,
+) -> str:
     duration_instruction = ""
     if target_duration_minutes and target_duration_minutes > 0:
         duration_instruction = (
@@ -280,64 +254,49 @@ def ask_script(
             "when there are not enough strong clips, return a shorter edit instead of adding mediocre filler."
         )
 
-    json_contract = (
-        "Return ONLY a valid JSON array. Do not wrap it in markdown and do not add explanations.\n"
-        "Each item must use this exact schema:\n"
-        "[\n"
-        '  {"source_file": "exact filename from catalog", "start_time": 0, "end_time": 30, "narration": "繁體中文段落說明"}\n'
-        "]\n"
-        "Strict rules:\n"
-        "1. source_file must exactly match a filename in the catalog, character-for-character. For example, do not change LRV_xxx.lrv to VID_xxx.lrv.\n"
-        "2. start_time and end_time must be numeric seconds taken from catalog segment boundaries. Never use HH:MM:SS or MM:SS strings.\n"
-        "3. Select from the entire catalog, not only the first few files or first few minutes.\n"
-        "4. narration must be written in Traditional Chinese.\n"
-        "5. If the material is insufficient for a meaningful edit, return []."
-    )
-
     if auto_prompt:
-        system = (
+        return (
             "You are a professional video editor. You will receive a catalog of source-video segments with timeline seconds, exact source filenames, and visual descriptions.\n"
             "Analyze all available material yourself, infer the best theme and story arc, then choose clips for a tight highlight video with a clear beginning, development, turn, and ending.\n"
-            f"{highlight_instruction}\n"
+            f"{_HIGHLIGHT_INSTRUCTION}\n"
             f"{duration_instruction}\n"
-            f"{json_contract}"
+            f"{_JSON_CONTRACT}"
         )
-    else:
-        system = (
-            "You are a professional video editor. You will receive a catalog of source-video segments with timeline seconds, exact source filenames, and visual descriptions.\n"
-            "Follow the user's request while still prioritizing a tight highlight edit with a clear beginning, development, turn, and ending.\n"
-            f"{highlight_instruction}\n"
-            f"{duration_instruction}\n"
-            f"{json_contract}"
-            + ("\nAdditional user request: " + prompt if prompt else "")
-        )
+    return (
+        "You are a professional video editor. You will receive a catalog of source-video segments with timeline seconds, exact source filenames, and visual descriptions.\n"
+        "Follow the user's request while still prioritizing a tight highlight edit with a clear beginning, development, turn, and ending.\n"
+        f"{_HIGHLIGHT_INSTRUCTION}\n"
+        f"{duration_instruction}\n"
+        f"{_JSON_CONTRACT}"
+        + ("\nAdditional user request: " + prompt if prompt else "")
+    )
 
-    user_msg = f"素材目錄：\n\n{catalog}"
 
-    if verbose:
-        click.echo(f"\n── LLM prompt ──", err=True)
-        click.echo(f"System: {system[:200]}...", err=True)
-        click.echo(f"User: {user_msg[:500]}...", err=True)
-        click.echo(f"Script API: {api_base}  Model: {model}" + (f"  Max tokens: {max_tokens}" if max_tokens else "  Max tokens: default/API-managed"), err=True)
-
-    base_url = _normalize_openai_base_url(api_base)
+def _call_script_api(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system: str,
+    user_msg: str,
+    max_tokens: int | None,
+    verbose: bool,
+) -> str:
+    """Call the OpenAI-compatible chat API, falling back to curl on network errors."""
 
     def _is_unsupported_token_param_error(err: object) -> bool:
         text = str(err).lower()
         return "unsupported parameter" in text and ("max_tokens" in text or "max_output_tokens" in text)
 
     def _call_via_curl() -> str:
-        import subprocess as _sub
-
         def _run(send_max_tokens: bool) -> dict:
-            payload = {
+            payload: dict = {
                 "model": model,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
                 "response_format": {"type": "json_object"},
             }
             if send_max_tokens and max_tokens is not None:
                 payload["max_tokens"] = max_tokens
-            result = _sub.run(
+            result = subprocess.run(
                 ["curl", "-s", "--max-time", "120",
                  f"{base_url}/chat/completions",
                  "-H", "Content-Type: application/json",
@@ -365,7 +324,6 @@ def ask_script(
             if verbose:
                 click.echo(f"  API connectivity: {detail}", err=True)
             client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
-
             call_kwargs: dict = {
                 "model": model,
                 "messages": [
@@ -376,7 +334,6 @@ def ask_script(
             }
             if max_tokens is not None:
                 call_kwargs["max_tokens"] = max_tokens
-
             try:
                 resp = client.chat.completions.create(**call_kwargs)
             except APIStatusError as api_err:
@@ -386,15 +343,14 @@ def ask_script(
                     resp = client.chat.completions.create(**call_kwargs)
                 else:
                     raise
-
-            content = resp.choices[0].message.content
+            return resp.choices[0].message.content
         else:
             if verbose:
                 click.echo(f"  API connectivity: {detail} — falling back to curl", err=True)
-            content = _call_via_curl()
+            return _call_via_curl()
     except (OSError, ConnectionError):
         click.echo("  ⚠ Python network blocked; falling back to curl...", err=True)
-        content = _call_via_curl()
+        return _call_via_curl()
     except Exception as e:
         click.echo(f"LLM call failed: {type(e).__name__}: {e}", err=True)
         click.echo(
@@ -415,6 +371,43 @@ def ask_script(
         )
         raise SystemExit(1)
 
+
+def ask_script(
+    catalog: str,
+    prompt: str,
+    verbose: bool,
+    auto_prompt: bool = False,
+    *,
+    script_api_base: str | None = None,
+    script_api_key: str | None = None,
+    script_api_model: str | None = None,
+    script_api_max_tokens: int | None = None,
+    target_duration_minutes: float | None = None,
+) -> list[dict]:
+    default_api_base, default_api_key, default_model, default_max_tokens = _script_api_defaults()
+    api_base = script_api_base or default_api_base
+    api_key = script_api_key or default_api_key
+    model = script_api_model or default_model
+    max_tokens = _safe_script_max_tokens(
+        script_api_max_tokens if script_api_max_tokens is not None else default_max_tokens
+    )
+
+    system = _build_script_system_prompt(auto_prompt, prompt, target_duration_minutes)
+    user_msg = f"素材目錄：\n\n{catalog}"
+    base_url = _normalize_openai_base_url(api_base)
+
+    if verbose:
+        click.echo("\n── LLM prompt ──", err=True)
+        click.echo(f"System: {system[:200]}...", err=True)
+        click.echo(f"User: {user_msg[:500]}...", err=True)
+        click.echo(
+            f"Script API: {api_base}  Model: {model}"
+            + (f"  Max tokens: {max_tokens}" if max_tokens else "  Max tokens: default/API-managed"),
+            err=True,
+        )
+
+    content = _call_script_api(base_url, api_key, model, system, user_msg, max_tokens, verbose)
+
     if verbose:
         click.echo(f"\n── LLM response ({len(content)} chars)──", err=True)
         click.echo(content[:1000], err=True)
@@ -423,17 +416,17 @@ def ask_script(
     if content.startswith("```"):
         content = content.split("\n", 1)[-1]
         content = content.rsplit("```", 1)[0].strip()
-
-    # repair common JSON mistakes from LLM output
     content = _repair_json(content)
 
     try:
         return _parse_json_or_recover_clips(content)
     except (json.JSONDecodeError, ValueError) as e:
         click.echo(f"Failed to parse LLM response: {e}", err=True)
-        hint = "The response was likely truncated. Try running again or with a more specific --prompt to reduce scope." if len(content) < 500 else ""
-        if hint:
-            click.echo(f"  {hint}", err=True)
+        if len(content) < 500:
+            click.echo(
+                "  The response was likely truncated. Try running again or with a more specific --prompt to reduce scope.",
+                err=True,
+            )
         click.echo(f"Raw ({len(content)} chars): {content[:500]}", err=True)
         raise SystemExit(1)
 
@@ -580,12 +573,11 @@ def render(selected: list[dict], *, output_path: str,
     enhance_settings = get_enhance_settings(enhance)
     if enhance_settings.preset != "none":
         click.echo(f"  Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
-    normalize_for_concat = True
 
     try:
         for i, s in enumerate(selected):
             clip_path = output_path.replace(".mp4", f"_{i}.mp4")
-            trim_source = _resolve_hq_source(s["source_file"], hq_dir) or s["source_file"]
+            trim_source = _resolve_hq_source(s["source_file"], hq_dir=hq_dir) or s["source_file"]
 
             if s.get("is_360"):
                 yaw = s.get("best_yaw", 0)
@@ -611,14 +603,11 @@ def render(selected: list[dict], *, output_path: str,
                     padding=1.0,
                 )
 
-            if normalize_for_concat:
-                normalized_path = output_path.replace(".mp4", f"_{i}_norm.mp4")
-                click.echo("  Normalizing clip for concat/output layout...")
-                _normalize_clip_for_concat(ffmpeg, clip_path, normalized_path, layout=resolved_layout)
-                temp_files.append(clip_path)
-                clip_path = normalized_path
-
-            clip_files.append(clip_path)
+            normalized_path = output_path.replace(".mp4", f"_{i}_norm.mp4")
+            click.echo("  Normalizing clip for concat/output layout...")
+            _normalize_clip_for_concat(ffmpeg, clip_path, normalized_path, layout=resolved_layout)
+            temp_files.append(clip_path)
+            clip_files.append(normalized_path)
 
         if not clip_files:
             raise RuntimeError("No clips were successfully trimmed.")
@@ -627,32 +616,15 @@ def render(selected: list[dict], *, output_path: str,
             for cf in clip_files:
                 f.write(f"file '{os.path.abspath(cf)}'\n")
 
-        if normalize_for_concat:
-            # Clips were already normalized to identical H.264/AAC parameters, so
-            # stream-copy concat is safe and avoids a second generation loss.
-            result = subprocess.run(
-                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-                 "-c", "copy", output_path],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0 or not os.path.isfile(output_path):
-                raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
-        else:
-            # All clips are the same source type; stream-copy is safe.
-            result = subprocess.run(
-                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-                 "-c", "copy", output_path],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0 or not os.path.isfile(output_path):
-                click.echo("Stream copy failed, re-encoding...")
-                result = subprocess.run(
-                    [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-                     "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", output_path],
-                    capture_output=True, text=True,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
+        # Clips were already normalized to identical H.264/AAC parameters, so
+        # stream-copy concat is safe and avoids a second generation loss.
+        result = subprocess.run(
+            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
+             "-c", "copy", output_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not os.path.isfile(output_path):
+            raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
 
         if enhance_settings.preset != "none":
             plan = build_enhance_plan(
