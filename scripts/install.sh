@@ -160,7 +160,22 @@ fi
 
 ok "Dependencies installed"
 
-# --- 6. .env ---
+# --- 6. tkinter for GUI (macOS + Homebrew Python) ---
+step "Checking tkinter (GUI)"
+if ! $VENV_PYTHON -c "import tkinter" 2>/dev/null; then
+  warn "tkinter not available — needed for autocut_gui.py"
+  if command -v brew &>/dev/null; then
+    info "  Installing python-tk via Homebrew..."
+    brew install python-tk@"$FULL"
+    ok "python-tk installed"
+  else
+    warn "  Install tkinter manually: brew install python-tk@$FULL"
+  fi
+else
+  ok "tkinter available"
+fi
+
+# --- 7. .env ---
 step "Environment configuration"
 
 if [ ! -f .env ]; then
@@ -170,7 +185,7 @@ else
   ok ".env already exists"
 fi
 
-# --- 7. verify ---
+# --- 8. verify ---
 step "Verifying installation"
 
 if $VENV_PYTHON -c "from sentrysearch.cli import cli; print('sentrysearch OK')" 2>/dev/null; then
