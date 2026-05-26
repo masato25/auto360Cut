@@ -185,7 +185,7 @@ printf "\n\033[1;32m━━━━━━━━━━━━━━━━━━━━
 printf "\033[1;32m  ✓ Installation complete!\033[0m\n"
 printf "\033[1;32m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"
 printf "\n"
-printf "  Run autoCut:\n"
+printf "  Run auto360Cut:\n"
 printf "    %s autocut.py <video> --prompt \"...\" -o output.mp4\n" "$VENV_PYTHON"
 printf "\n"
 printf "  Edit your .env file to configure API endpoints.\n"

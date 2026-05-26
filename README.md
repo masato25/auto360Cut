@@ -1,6 +1,6 @@
-# autoCut
+# auto360Cut
 
-autoCut 是一個用來把 360 / 一般影片做「語意搜尋」與「自動剪輯」的本地工作流專案。
+auto360Cut 是一個用來把 360 / 一般影片做「語意搜尋」與「自動剪輯」的本地工作流專案。
 
 它以 [`sentrysearch`](./sentrysearch/README.md)（forked from [ssrajadh/sentrysearch](https://github.com/ssrajadh/sentrysearch)）為核心，補上更適合 360 相機素材的使用方式：
 
@@ -32,7 +32,7 @@ brew install python-tk@3.14
 
 ## 這個專案是什麼
 
-autoCut 提供一個偏實用的影片處理流程：
+auto360Cut 提供一個偏實用的影片處理流程：
 
 1. 先用較小的代理檔建立索引
 2. 用文字描述找出你想要的片段
@@ -53,13 +53,13 @@ autoCut 提供一個偏實用的影片處理流程：
 ```text
 Insta360 原始素材
 ├─ .insv   → 保留原始 360 檔，必要時用 Insta360 Studio 匯出 HQ MP4
-├─ .lrv    → 給 autoCut 做索引、caption、語意搜尋、視角判定
-└─ HQ .mp4 → 給 autoCut 做最終裁切與輸出
+├─ .lrv    → 給 auto360Cut 做索引、caption、語意搜尋、視角判定
+└─ HQ .mp4 → 給 auto360Cut 做最終裁切與輸出
 
 使用流程
 1. 準備 LRV 與 HQ MP4
 2. 用文字 prompt 找片段
-3. autoCut 決定要保留哪些 clip
+3. auto360Cut 決定要保留哪些 clip
 4. 若為 360 影片，轉成指定/自動視角的平面畫面
 5. 拼接輸出成最終影片
 ```
@@ -214,13 +214,13 @@ Script Mode 也支援同樣參數：
 
 1. 拍攝後會拿到原始 `.insv`
 2. 相機也會產生 `.lrv` 代理檔
-3. 先用 `.lrv` 給 autoCut 做分析
+3. 先用 `.lrv` 給 auto360Cut 做分析
 4. 用 Insta360 Studio 把需要的原始 360 影片匯出成高畫質 equirectangular `.mp4`
-5. 再用 `--hq-dir` 或 `--hq-source` 讓 autoCut 從 HQ 檔輸出成品
+5. 再用 `--hq-dir` 或 `--hq-source` 讓 auto360Cut 從 HQ 檔輸出成品
 
 ### 自動視角如何運作
 
-360 索引時，autoCut 會先把每個 chunk 轉成四個平面視角：`front`、`right`、`back`、`left`，分別送到 local-api 產生 caption 與 embedding。接著它會把你的 `--prompt` 也轉成 embedding，和四個視角 caption 比對，將最符合 prompt 的方向寫入 metadata：
+360 索引時，auto360Cut 會先把每個 chunk 轉成四個平面視角：`front`、`right`、`back`、`left`，分別送到 local-api 產生 caption 與 embedding。接著它會把你的 `--prompt` 也轉成 embedding，和四個視角 caption 比對，將最符合 prompt 的方向寫入 metadata：
 
 - `best_direction` / `best_yaw`：後續 `--view auto` 輸出時使用的視角
 - `viewport_prompt`：建立此索引時使用的 prompt
@@ -242,7 +242,7 @@ Script Mode 也支援同樣參數：
 - `people interacting closely with the camera wearer`
 
 ### `--hq-dir`
-指定高畫質輸出來源資料夾，讓 autoCut 自動對應 LRV 與 HQ MP4。
+指定高畫質輸出來源資料夾，讓 auto360Cut 自動對應 LRV 與 HQ MP4。
 
 ### `--hq-source`
 直接指定某一個高畫質來源檔案。
@@ -266,7 +266,7 @@ Script Mode 也支援同樣參數：
 ## 安裝檔說明
 
 - `requirements.txt`
-  - autoCut root venv 的基礎安裝需求
+  - auto360Cut root venv 的基礎安裝需求
   - 包含 pip 常用建置工具與最基本啟動依賴
 - `requirements-local-api.txt`
   - 建議使用自架 llama.cpp / llmcpp / OpenAI 相容 HTTP API 的工作流使用
@@ -315,5 +315,5 @@ python3 -m venv .venv
 ## 注意事項
 
 - `.insv` 通常不是直接拿來做最終平面輸出的主要來源，建議先經過 Insta360 Studio 匯出
-- 如果你改的是「360 視角判定策略」或 `--prompt`，autoCut 會重建過期 chunk；必要時也可用 `--force-reindex` 全部重建
+- 如果你改的是「360 視角判定策略」或 `--prompt`，auto360Cut 會重建過期 chunk；必要時也可用 `--force-reindex` 全部重建
 - 若要得到較好的輸出品質，請盡量使用 HQ MP4，而不是直接拿 LRV 當成成品來源

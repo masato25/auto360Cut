@@ -1,4 +1,4 @@
-# Recommended install for autoCut when using the qwen-cloud backend.
+# Recommended install for auto360Cut when using the qwen-cloud backend.
 #
 # This pulls in the editable sentrysearch package plus the DashScope SDK
 # required by sentrysearch.qwen_cloud_embedder.

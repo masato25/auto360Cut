@@ -1,6 +1,6 @@
-# autoCut bootstrap dependencies
+# auto360Cut bootstrap dependencies
 #
-# Install this file inside the autoCut root virtual environment first,
+# Install this file inside the auto360Cut root virtual environment first,
 # then install the editable sentrysearch package with the desired extras.
 #
 # Example:

@@ -20,7 +20,7 @@
 ```
 MacBook (Intel, 無 GPU)               遠端伺服器 (192.168.0.207, 有 GPU)
 ┌──────────────────────────┐          ┌──────────────────────────────┐
-│ autoCut (autocut.py)     │          │ llama.cpp 伺服器             │
+│ auto360Cut (autocut.py)  │          │ llama.cpp 伺服器             │
 │                          │ HTTP POST│                              │
 │ 1. 讀取影片檔             │ ───────→ │ llama-server                 │
 │ 2. ffmpeg 拆幀/轉檔       │          │   -m Qwen2.5-VL-7B.Q4_K_M   │
@@ -144,7 +144,7 @@ python -m pip install --upgrade pip
 # brew install expat
 # export DYLD_LIBRARY_PATH=/opt/homebrew/Cellar/expat/2.8.1/lib
 
-# 安裝 autoCut 依賴（含 local-api backend）
+# 安裝 auto360Cut 依賴（含 local-api backend）
 python -m pip install -r requirements-local-api.txt
 ```
 
@@ -158,7 +158,7 @@ python -m pip install -r requirements-local-api.txt
 
 ## 環境設定
 
-API 位址與模型名稱透過 `.env` 設定（位於 autoCut 專案根目錄）：
+API 位址與模型名稱透過 `.env` 設定（位於 auto360Cut 專案根目錄）：
 
 ```bash
 cp .env.example .env
@@ -260,7 +260,7 @@ chunk_000.mp4
 ### 參數分工
 
 - `--prompt`：控制選哪些片段，也控制 360 自動視角要偏向哪種畫面；同一段 chunk 可能因 prompt 不同而選到不同 `best_direction`
-- `--force-reindex`：重建既有 chunk 的索引；若 cached caption 為空、視角索引版本過期、projection 改變，或 360 索引使用的 prompt 不同，autoCut 也會自動重建該 chunk
+- `--force-reindex`：重建既有 chunk 的索引；若 cached caption 為空、視角索引版本過期、projection 改變，或 360 索引使用的 prompt 不同，auto360Cut 也會自動重建該 chunk
 - `--view`：最終輸出時強制使用 `front/right/back/left`；預設 `auto` 使用索引 metadata 的最佳視角
 - `--yaw`：最終輸出時直接指定角度，優先權高於 `--view`
 
@@ -281,14 +281,14 @@ chunk_000.mp4
 1. 用原始 `.lrv` 建 index
 2. 用 Insta360 Studio 把 `.insv` 匯出成高畫質 equirectangular MP4
 3. autocut 時帶 `--hq-dir` 或 `--hq-source` 讓最終修剪從 HQ 素材輸出
-4. 若 HQ 是 equirect，而 LRV 是 dfisheye，autoCut 會以 trim 後實際來源重新判定投影，降低變形風險
+4. 若 HQ 是 equirect，而 LRV 是 dfisheye，auto360Cut 會以 trim 後實際來源重新判定投影，降低變形風險
 
 ### 關於變形問題
 
 先前你遇到的「拉長 / 過度伸展」通常有兩種來源：
 
-1. **投影後再硬縮放**：現在已改回由上游處理；autoCut 本身不再 fork 這段邏輯
-2. **把 HQ equirect MP4 誤當成 dfisheye 來轉**：目前 autoCut 會對真正拿來 trim 的來源重新偵測 projection，避免直接沿用 LRV index metadata 的投影類型
+1. **投影後再硬縮放**：現在已改回由上游處理；auto360Cut 本身不再 fork 這段邏輯
+2. **把 HQ equirect MP4 誤當成 dfisheye 來轉**：目前 auto360Cut 會對真正拿來 trim 的來源重新偵測 projection，避免直接沿用 LRV index metadata 的投影類型
 
 如果 HQ 檔本身已經是標準 equirect，這點特別重要。
 

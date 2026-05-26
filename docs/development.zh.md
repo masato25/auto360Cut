@@ -1,4 +1,4 @@
-# autoCut 開發說明
+# auto360Cut 開發說明
 
 這份文件只記錄開發相關資訊。
 
@@ -7,8 +7,8 @@
 ## 專案結構
 
 ```text
-autoCut/
-├─ autocut.py              # 主專案入口，放 autoCut 自己的 CLI 與客製工作流
+auto360Cut/
+├─ autocut.py              # 主專案入口，放 auto360Cut 自己的 CLI 與客製工作流
 ├─ docs/
 │  ├─ 360-video-guide.zh.md
 │  └─ development.zh.md
@@ -36,10 +36,10 @@ autoCut/
 原則上：
 - 能不改就不改
 - 若必須修改，盡量做最小改動
-- autoCut 專案自己的工作流、參數、包裝入口，優先放在根目錄 `autocut.py`
+- auto360Cut 專案自己的工作流、參數、包裝入口，優先放在根目錄 `autocut.py`
 - 若某功能明顯屬於本專案客製需求，應避免把大量邏輯直接灌進 submodule
 
-### 3. autoCut 的客製功能集中在主入口
+### 3. auto360Cut 的客製功能集中在主入口
 
 以下類型的功能，優先放在 `autocut.py` 或本 repo 自己的文件／包裝層：
 - 360 工作流整合
@@ -95,7 +95,7 @@ autoCut/
 目前建議使用專案自己的虛擬環境執行：
 
 ```bash
-cd /Users/geassbot/Movies/autoCut
+cd /Users/geassbot/Movies/auto360Cut
 source .venv/bin/activate
 ```
 

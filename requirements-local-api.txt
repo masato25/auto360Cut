@@ -1,6 +1,6 @@
-# Recommended install for autoCut when using a local / remote OpenAI-compatible API.
+# Recommended install for auto360Cut when using a local / remote OpenAI-compatible API.
 #
 # This pulls in the editable sentrysearch package plus the dependencies needed
-# for the local-api backend used by the autoCut workflow.
+# for the local-api backend used by the auto360Cut workflow.
 -r requirements.txt
 -e ./sentrysearch[local-api]
