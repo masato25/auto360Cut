@@ -14,7 +14,6 @@ from .tabs.index_tab import IndexTab
 from .tabs.normal_tab import NormalTab
 from .tabs.script_tab import ScriptTab
 from .tabs.auto_tab import AutoTab
-from .tabs.date_tab import DateTab
 
 
 class AutocutGUI(tk.Tk):
@@ -49,7 +48,7 @@ class AutocutGUI(tk.Tk):
         main.pack(fill=tk.BOTH, expand=True)
 
         notebook = ttk.Notebook(main)
-        for cls in [IndexTab, NormalTab, ScriptTab, AutoTab, DateTab]:
+        for cls in [IndexTab, NormalTab, ScriptTab, AutoTab]:
             tab = cls(notebook, self)
             notebook.add(tab, text=cls.TAB_LABEL)
             self._tabs.append(tab)
