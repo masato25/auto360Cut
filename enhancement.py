@@ -45,32 +45,32 @@ _PRESETS: dict[str, EnhanceSettings] = {
     "light": EnhanceSettings(
         preset="light",
         video_filter="eq=contrast=1.04:saturation=1.08:brightness=0.01,unsharp=5:5:0.45:3:3:0.2",
-        audio_filter="loudnorm=I=-16:TP=-1.5:LRA=11",
+        audio_filter=None,
         video_codec="libx264",
         crf="21",
         preset_speed="medium",
         audio_bitrate="160k",
-        description="Subtle contrast/saturation/sharpening plus loudness normalization.",
+        description="Subtle contrast/saturation/sharpening (audio filter removed to prevent sync issues).",
     ),
     "vivid": EnhanceSettings(
         preset="vivid",
         video_filter="eq=contrast=1.08:saturation=1.18:brightness=0.015,unsharp=5:5:0.65:3:3:0.25",
-        audio_filter="loudnorm=I=-16:TP=-1.5:LRA=10",
+        audio_filter=None,
         video_codec="libx264",
         crf="20",
         preset_speed="medium",
         audio_bitrate="192k",
-        description="Punchier colors and sharpening for travel/action footage.",
+        description="Punchier colors and sharpening for travel/action footage (audio filter removed to prevent sync issues).",
     ),
     "cinematic": EnhanceSettings(
         preset="cinematic",
         video_filter="eq=contrast=1.10:saturation=1.05:brightness=-0.005,unsharp=5:5:0.35:3:3:0.15",
-        audio_filter="highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=12",
+        audio_filter=None,
         video_codec="libx264",
         crf="20",
         preset_speed="medium",
         audio_bitrate="192k",
-        description="Slightly deeper contrast with restrained saturation and cleaned voice/music lows.",
+        description="Slightly deeper contrast with restrained saturation (audio filter removed to prevent sync issues).",
     ),
 }
 
@@ -112,16 +112,14 @@ def ffmpeg_enhance_args(settings: EnhanceSettings) -> list[str]:
     args: list[str] = []
     if settings.video_filter:
         args.extend(["-vf", settings.video_filter])
-    if settings.audio_filter:
-        args.extend(["-af", settings.audio_filter])
+    # NOTE: -af (audio filter) removed to prevent audio/video sync issues
+    # caused by loudnorm/highpass filters. Only video filters are applied.
     args.extend([
         "-c:v", settings.video_codec,
         "-preset", settings.preset_speed,
         "-crf", settings.crf,
         "-c:a", "aac",
         "-b:a", settings.audio_bitrate,
-        "-ar", "48000",
-        "-ac", "2",
         "-movflags", "+faststart",
     ])
     return args
