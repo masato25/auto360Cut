@@ -1,7 +1,9 @@
 
+from pathlib import Path
+
 from autocut_script import (
     OUTPUT_LAYOUT_CHOICES,
-    DEFAULT_OPENING_CAPTION_DURATION,
+    DEFAULT_CAPTION_DURATION,
     _build_script_system_prompt,
     _choose_output_layout,
     _coerce_script_response,
@@ -9,6 +11,7 @@ from autocut_script import (
     _opening_caption_drawtext_filter,
     _opening_caption_fontfile,
     _normalize_opening_caption_duration,
+    render,
     _opening_caption_dimensions,
     _normalize_openai_base_url,
     _parse_json_or_recover_clips,
@@ -51,7 +54,7 @@ def test_opening_caption_dimensions_follow_layout() -> None:
 
 
 def test_opening_caption_duration_default_and_positive() -> None:
-    assert _normalize_opening_caption_duration(None) == DEFAULT_OPENING_CAPTION_DURATION
+    assert _normalize_opening_caption_duration(None) == DEFAULT_CAPTION_DURATION
     assert _normalize_opening_caption_duration(2.5) == 2.5
 
 
@@ -295,6 +298,76 @@ def test_format_catalog_truncates_at_max_chars() -> None:
     truncated = format_catalog(rows, max_chars=50)
     assert len(truncated) <= len(full)
     assert "truncated" in truncated
+
+
+# ── render caption ordering ─────────────────────────────────────────────────
+
+
+def test_render_appends_closing_caption_after_clips(monkeypatch, tmp_path) -> None:
+    rendered_titles = []
+    normalized = []
+    concat_files = []
+
+    def fake_get_ffmpeg() -> str:
+        return "ffmpeg"
+
+    def fake_render_caption(ffmpeg, *, text, output_path, layout, duration=None):
+        rendered_titles.append((text, output_path, duration))
+        Path(output_path).write_text(text, encoding="utf-8")
+        return output_path
+
+    def fake_normalize(ffmpeg, input_path, output_path, *, layout):
+        normalized.append(output_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return output_path
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if "concat" in cmd:
+            list_path = Path(cmd[cmd.index("-i") + 1])
+            concat_files.extend(
+                line.split("'", 2)[1]
+                for line in list_path.read_text(encoding="utf-8").splitlines()
+            )
+            Path(cmd[-1]).write_text("output", encoding="utf-8")
+        class Result:
+            returncode = 0
+            stderr = ""
+        return Result()
+
+    monkeypatch.setattr("autocut_script._get_ffmpeg", fake_get_ffmpeg)
+    monkeypatch.setattr("autocut_script._render_opening_caption_clip", fake_render_caption)
+    monkeypatch.setattr("autocut_script._normalize_clip_for_concat", fake_normalize)
+    monkeypatch.setattr("autocut_script._resolve_hq_source", lambda source_file, hq_dir=None: source_file)
+    monkeypatch.setattr("autocut_script.subprocess.run", fake_run)
+
+    import sys
+    import types
+    trimmer = types.ModuleType("sentrysearch.trimmer")
+    def fake_trim_clip(source_file, start_time, end_time, output_path, padding=1.0):
+        Path(output_path).write_text("raw", encoding="utf-8")
+    trimmer.trim_clip = fake_trim_clip
+    sentrysearch = types.ModuleType("sentrysearch")
+    sentrysearch.trimmer = trimmer
+    monkeypatch.setitem(sys.modules, "sentrysearch", sentrysearch)
+    monkeypatch.setitem(sys.modules, "sentrysearch.trimmer", trimmer)
+
+    output = tmp_path / "out.mp4"
+    render(
+        [{"source_file": "clip.mp4", "start_time": 0, "end_time": 1}],
+        output_path=str(output),
+        hq_dir=None,
+        output_layout="landscape",
+        opening_caption="Start",
+        opening_caption_duration=1.5,
+        closing_caption="End",
+        closing_caption_duration=2.5,
+    )
+
+    # Opening/closing captions intentionally share one duration; if both legacy
+    # args are passed, opening_caption_duration wins for compatibility.
+    assert rendered_titles == [("Start", str(tmp_path / "out_opening_caption.mp4"), 1.5), ("End", str(tmp_path / "out_closing_caption.mp4"), 1.5)]
+    assert concat_files == [str(tmp_path / "out_opening_caption.mp4"), str(tmp_path / "out_0_norm.mp4"), str(tmp_path / "out_closing_caption.mp4")]
+    assert output.exists()
 
 
 # ── _normalize_openai_base_url ───────────────────────────────────────────────

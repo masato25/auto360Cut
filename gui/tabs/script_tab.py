@@ -6,6 +6,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from .base import BaseTab
+from ..settings import is_verbose_enabled
+from ..utils import bind_listbox_double_click_to_play, play_selected_listbox_video
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -22,10 +24,8 @@ class ScriptTab(BaseTab):
     def __init__(self, parent, app):
         self.script_files: list[str] = []
         self.script_prompt = tk.StringVar(value=_DEFAULT_PROMPT)
-        self.script_backend = tk.StringVar(value="local-api")
-        self.script_verbose = tk.BooleanVar(value=False)
         self.script_opening_caption = tk.StringVar(value="")
-        self.script_opening_caption_duration = tk.StringVar(value="3")
+        self.script_closing_caption = tk.StringVar(value="")
         self.script_output = tk.StringVar()
         super().__init__(parent, app)
 
@@ -37,10 +37,13 @@ class ScriptTab(BaseTab):
         lrow.pack(fill=tk.X, pady=(4, 0))
         self.script_listbox = tk.Listbox(lrow, height=4, font=("Menlo", 10))
         self.script_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        bind_listbox_double_click_to_play(self.script_listbox, self.script_files)
         btn_frame = ttk.Frame(lrow)
         btn_frame.pack(side=tk.RIGHT, padx=(6, 0), fill=tk.Y)
         ttk.Button(btn_frame, text="新增影片…", command=self._add_files).pack(pady=(0, 4))
-        ttk.Button(btn_frame, text="移除選取", command=self._remove_selected).pack()
+        ttk.Button(btn_frame, text="播放選取", command=self._play_selected).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="移除選取", command=self._remove_selected).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="清空", command=self._clear_files).pack()
 
         rp = ttk.Frame(self)
         rp.pack(fill=tk.X, pady=(0, 6))
@@ -49,23 +52,17 @@ class ScriptTab(BaseTab):
         self.script_prompt_entry.pack(fill=tk.X, pady=(4, 0))
         self.script_prompt_entry.insert("1.0", self.script_prompt.get())
 
-        sopts = ttk.Frame(self)
-        sopts.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(sopts, text="後端").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
-        ttk.Combobox(sopts, textvariable=self.script_backend,
-                     values=["local-api", "local", "qwen-cloud", "gemini"],
-                     state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
-        ttk.Checkbutton(sopts, text="詳細日誌",
-                        variable=self.script_verbose).grid(row=0, column=2, sticky=tk.W)
-
         cap = ttk.Frame(self)
         cap.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(cap, text="開場字幕（可選）", font=("", 11, "bold")).grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(cap, text="秒數").grid(row=0, column=1, sticky=tk.E, padx=(12, 4))
-        ttk.Entry(cap, textvariable=self.script_opening_caption_duration,
-                  width=6).grid(row=0, column=2, sticky=tk.W)
-        ttk.Entry(cap, textvariable=self.script_opening_caption).grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
+        ttk.Entry(cap, textvariable=self.script_opening_caption).grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
         cap.columnconfigure(0, weight=1)
+
+        ccap = ttk.Frame(self)
+        ccap.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(ccap, text="閉場字幕（可選）", font=("", 11, "bold")).grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(ccap, textvariable=self.script_closing_caption).grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
+        ccap.columnconfigure(0, weight=1)
 
         ro = ttk.Frame(self)
         ro.pack(fill=tk.X, pady=(0, 6))
@@ -91,6 +88,9 @@ class ScriptTab(BaseTab):
             stem = Path(self.script_files[0]).stem
             self.script_output.set(str(Path.home() / "Movies" / f"{stem}_script.mp4"))
 
+    def _play_selected(self) -> None:
+        play_selected_listbox_video(self.script_listbox, self.script_files)
+
     def _remove_selected(self) -> None:
         sel = self.script_listbox.curselection()
         if not sel:
@@ -98,6 +98,10 @@ class ScriptTab(BaseTab):
         idx = sel[0]
         self.script_listbox.delete(idx)
         del self.script_files[idx]
+
+    def _clear_files(self) -> None:
+        self.script_files.clear()
+        self.script_listbox.delete(0, tk.END)
 
     def _browse_output(self) -> None:
         f = filedialog.asksaveasfilename(
@@ -121,14 +125,7 @@ class ScriptTab(BaseTab):
             return
 
         opening_caption = self.script_opening_caption.get().strip()
-        opening_caption_duration = self.script_opening_caption_duration.get().strip()
-        if opening_caption:
-            try:
-                if float(opening_caption_duration or "3") <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("錯誤", "開場字幕秒數必須是正數")
-                return
+        closing_caption = self.script_closing_caption.get().strip()
 
         output = self.script_output.get().strip()
         if not output:
@@ -140,13 +137,14 @@ class ScriptTab(BaseTab):
             str(_ROOT / "autocut_script.py"), "create",
             *self.script_files,
             "--prompt", prompt,
-            "--backend", self.script_backend.get(),
             "-o", output,
         ]
         if opening_caption:
             args.extend(["--opening-caption", opening_caption])
-            args.extend(["--opening-caption-duration", opening_caption_duration or "3"])
-        if self.script_verbose.get():
+        if closing_caption:
+            args.extend(["--closing-caption", closing_caption])
+        verbose_enabled = is_verbose_enabled()
+        if verbose_enabled:
             args.append("--verbose")
 
         self.app.clear_log()
@@ -154,10 +152,11 @@ class ScriptTab(BaseTab):
         for sf in self.script_files:
             self.app.log(f"    {Path(sf).name}")
         self.app.log(f"  Prompt: {prompt}")
-        self.app.log(f"  Backend: {self.script_backend.get()}")
+        self.app.log("  Backend: from .env AUTOCUT_BACKEND")
         self.app.log(f"  Opening caption: {opening_caption or 'none'}")
-        if opening_caption:
-            self.app.log(f"  Opening caption duration: {opening_caption_duration or '3'}s")
+        self.app.log(f"  Closing caption: {closing_caption or 'none'}")
+        if opening_caption or closing_caption:
+            self.app.log("  Caption duration: from .env AUTOCUT_CAPTION_DURATION_SECONDS (default 3s)")
         self.app.log(f"  Output: {output}")
         self.app.log("")
 

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from .base import BaseTab
+from ..settings import is_verbose_enabled
+from ..utils import open_file_with_default_app
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -30,7 +31,6 @@ class NormalTab(BaseTab):
         self.is_360 = tk.BooleanVar(value=False)
         self.output_path = tk.StringVar()
         self.face_path = tk.StringVar()
-        self.verbose = tk.BooleanVar(value=False)
         self.force_reindex = tk.BooleanVar(value=False)
         self.view_angle = tk.StringVar(value="auto")
         super().__init__(parent, app)
@@ -63,8 +63,6 @@ class NormalTab(BaseTab):
                      state="readonly", width=12).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
         ttk.Checkbutton(opts, text="360 模式",
                         variable=self.is_360).grid(row=0, column=4, sticky=tk.W)
-        ttk.Checkbutton(opts, text="詳細日誌",
-                        variable=self.verbose).grid(row=0, column=5, sticky=tk.W, padx=(10, 0))
         ttk.Label(opts, text="360 角度").grid(row=1, column=0, sticky=tk.W, padx=(0, 4))
         ttk.Combobox(opts, textvariable=self.view_angle,
                      values=["auto", "front", "right", "back", "left"],
@@ -97,7 +95,7 @@ class NormalTab(BaseTab):
         if not path or not os.path.isfile(path):
             messagebox.showwarning("提示", "請先選擇影片檔案")
             return
-        subprocess.Popen(["open", path])
+        open_file_with_default_app(path)
 
     def _browse_file(self) -> None:
         f = filedialog.askopenfilename(
@@ -165,7 +163,8 @@ class NormalTab(BaseTab):
             args.extend(["--view", view])
         if self.force_reindex.get():
             args.append("--force-reindex")
-        if self.verbose.get():
+        verbose_enabled = is_verbose_enabled()
+        if verbose_enabled:
             args.append("--verbose")
 
         self.app.clear_log()

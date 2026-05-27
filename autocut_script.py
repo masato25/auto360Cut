@@ -494,7 +494,10 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 
 # ── 4. render ────────────────────────────────────────────────────────
 OUTPUT_LAYOUT_CHOICES = ("landscape", "portrait")
-DEFAULT_OPENING_CAPTION_DURATION = 3.0
+CAPTION_DURATION_ENV = "AUTOCUT_CAPTION_DURATION_SECONDS"
+DEFAULT_CAPTION_DURATION = 3.0
+# Backward-compatible name for older callers/tests.
+DEFAULT_OPENING_CAPTION_DURATION = DEFAULT_CAPTION_DURATION
 
 
 def _render_layout_filter(layout: str) -> tuple[str, int | None, int | None]:
@@ -543,13 +546,27 @@ def _opening_caption_dimensions(layout: str) -> tuple[int, int]:
     return width, height
 
 
-def _normalize_opening_caption_duration(duration: float | int | None) -> float:
-    if duration is None:
-        return DEFAULT_OPENING_CAPTION_DURATION
-    duration = float(duration)
-    if duration <= 0:
-        raise ValueError("opening caption duration must be positive")
-    return duration
+def _normalize_caption_duration(duration: float | int | str | None = None) -> float:
+    """Return the title/closing-card duration.
+
+    One shared duration is used for both opening and closing captions.  It
+    defaults to 3 seconds and can be changed with AUTOCUT_CAPTION_DURATION_SECONDS.
+    """
+    raw = duration
+    if raw is None:
+        raw = os.environ.get(CAPTION_DURATION_ENV, "").strip() or DEFAULT_CAPTION_DURATION
+    try:
+        normalized = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{CAPTION_DURATION_ENV} must be a positive number") from exc
+    if normalized <= 0:
+        raise ValueError(f"{CAPTION_DURATION_ENV} must be positive")
+    return normalized
+
+
+def _normalize_opening_caption_duration(duration: float | int | str | None = None) -> float:
+    """Backward-compatible wrapper for the shared caption duration."""
+    return _normalize_caption_duration(duration)
 
 
 _CJK_FONT_CANDIDATES = (
@@ -683,8 +700,9 @@ def render(selected: list[dict], *, output_path: str,
            hq_dir: str | None, output_layout: str,
            enhance: str = "none", enhance_plan_path: str | None = None,
            opening_caption: str | None = None,
-           opening_caption_duration: float | int | None = None) -> None:
-    from autocut import convert_clip_to_flat, detect_360_projection
+           opening_caption_duration: float | int | None = None,
+           closing_caption: str | None = None,
+           closing_caption_duration: float | int | None = None) -> None:
     from sentrysearch.trimmer import trim_clip
 
     ffmpeg = _get_ffmpeg()
@@ -702,9 +720,20 @@ def render(selected: list[dict], *, output_path: str,
     if enhance_settings.preset != "none":
         click.echo(f"  Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
     opening_caption_text = (opening_caption or "").strip()
+    closing_caption_text = (closing_caption or "").strip()
+    caption_duration: float | None = None
+    if opening_caption_text or closing_caption_text:
+        # One shared setting for both opening and closing captions.  GUI/CLI do
+        # not expose per-caption duration; set AUTOCUT_CAPTION_DURATION_SECONDS
+        # in .env to change it from the default 3 seconds.
+        explicit_duration = opening_caption_duration if opening_caption_duration is not None else closing_caption_duration
+        caption_duration = _normalize_caption_duration(explicit_duration)
     if opening_caption_text:
-        opening_caption_duration = _normalize_opening_caption_duration(opening_caption_duration)
+        opening_caption_duration = caption_duration
         click.echo(f"  Opening caption: {opening_caption_text} ({opening_caption_duration:g}s)")
+    if closing_caption_text:
+        closing_caption_duration = caption_duration
+        click.echo(f"  Closing caption: {closing_caption_text} ({closing_caption_duration:g}s)")
 
     try:
         if opening_caption_text:
@@ -724,6 +753,8 @@ def render(selected: list[dict], *, output_path: str,
             trim_source = _resolve_hq_source(s["source_file"], hq_dir=hq_dir) or s["source_file"]
 
             if s.get("is_360"):
+                from autocut import convert_clip_to_flat, detect_360_projection
+
                 yaw = s.get("best_yaw", 0)
                 direction = s.get("best_direction", "front")
                 intermediate = clip_path.replace(".mp4", "_raw.mp4")
@@ -753,6 +784,18 @@ def render(selected: list[dict], *, output_path: str,
             temp_files.append(clip_path)
             clip_files.append(normalized_path)
 
+        if closing_caption_text:
+            closing_path = output_path.replace(".mp4", "_closing_caption.mp4")
+            click.echo("  Rendering closing caption...")
+            _render_opening_caption_clip(
+                ffmpeg,
+                text=closing_caption_text,
+                output_path=closing_path,
+                layout=resolved_layout,
+                duration=closing_caption_duration,
+            )
+            clip_files.append(closing_path)
+
         if not clip_files:
             raise RuntimeError("No clips were successfully trimmed.")
 
@@ -781,6 +824,8 @@ def render(selected: list[dict], *, output_path: str,
                     "output_layout": resolved_layout,
                     "opening_caption": opening_caption_text,
                     "opening_caption_duration": opening_caption_duration if opening_caption_text else None,
+                    "closing_caption": closing_caption_text,
+                    "closing_caption_duration": closing_caption_duration if closing_caption_text else None,
                 },
             )
             plan_path = write_enhance_plan(plan, enhance_plan_path)
@@ -865,8 +910,12 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Final video shape: landscape (橫式) or portrait (直式).")
 @click.option("--opening-caption", default=None,
               help="Optional opening caption/title card text to insert before the first clip.")
-@click.option("--opening-caption-duration", default=DEFAULT_OPENING_CAPTION_DURATION, type=float, show_default=True,
-              help="Duration in seconds for --opening-caption.")
+@click.option("--opening-caption-duration", default=None, type=float, hidden=True,
+              help="Deprecated. Caption duration is now shared via AUTOCUT_CAPTION_DURATION_SECONDS.")
+@click.option("--closing-caption", default=None,
+              help="Optional closing caption/title card text to append after the last clip.")
+@click.option("--closing-caption-duration", default=None, type=float, hidden=True,
+              help="Deprecated. Caption duration is now shared via AUTOCUT_CAPTION_DURATION_SECONDS.")
 @click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
               help="Apply a final preset-based video/audio enhancement pass.")
 @click.option("--enhance-plan", default=None,
@@ -878,6 +927,7 @@ def create(videos, prompt, output, backend, model,
            script_api_key, script_api_model, script_api_max_tokens,
            catalog_max_chars, target_duration_minutes, output_layout,
            opening_caption, opening_caption_duration,
+           closing_caption, closing_caption_duration,
            enhance, enhance_plan, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
@@ -949,6 +999,8 @@ def create(videos, prompt, output, backend, model,
         enhance_plan_path=str(Path(enhance_plan).expanduser().resolve()) if enhance_plan else None,
         opening_caption=opening_caption,
         opening_caption_duration=opening_caption_duration,
+        closing_caption=closing_caption,
+        closing_caption_duration=closing_caption_duration,
     )
 
     click.echo(f"\nDone: {output_path}")
