@@ -1,9 +1,15 @@
 
 from autocut_script import (
     OUTPUT_LAYOUT_CHOICES,
+    DEFAULT_OPENING_CAPTION_DURATION,
     _build_script_system_prompt,
     _choose_output_layout,
     _coerce_script_response,
+    _escape_drawtext_text,
+    _opening_caption_drawtext_filter,
+    _opening_caption_fontfile,
+    _normalize_opening_caption_duration,
+    _opening_caption_dimensions,
     _normalize_openai_base_url,
     _parse_json_or_recover_clips,
     _parse_time,
@@ -37,6 +43,49 @@ def test_choose_output_layout_rejects_auto() -> None:
         assert "portrait" in str(exc)
     else:
         raise AssertionError("auto layout should not be accepted")
+
+
+def test_opening_caption_dimensions_follow_layout() -> None:
+    assert _opening_caption_dimensions("landscape") == (1280, 720)
+    assert _opening_caption_dimensions("portrait") == (1080, 1920)
+
+
+def test_opening_caption_duration_default_and_positive() -> None:
+    assert _normalize_opening_caption_duration(None) == DEFAULT_OPENING_CAPTION_DURATION
+    assert _normalize_opening_caption_duration(2.5) == 2.5
+
+
+def test_opening_caption_duration_rejects_non_positive() -> None:
+    try:
+        _normalize_opening_caption_duration(0)
+    except ValueError as exc:
+        assert "positive" in str(exc)
+    else:
+        raise AssertionError("zero duration should be rejected")
+
+
+def test_escape_drawtext_text_escapes_special_chars() -> None:
+    escaped = _escape_drawtext_text("A:B's 100%\\nok")
+    assert r"A\:B\'s 100\%" in escaped
+    assert r"\n" in escaped
+
+
+def test_opening_caption_drawtext_filter_uses_boxed_white_text(monkeypatch) -> None:
+    monkeypatch.setenv("AUTOCUT_OPENING_CAPTION_FONT", "/tmp/Noto Sans CJK.ttc")
+
+    vf = _opening_caption_drawtext_filter("旅程開始", layout="landscape")
+
+    assert "fontfile='/tmp/Noto Sans CJK.ttc'" in vf
+    assert "text='旅程開始'" in vf
+    assert "fontcolor=white" in vf
+    assert "box=1" in vf
+    assert "boxcolor=black@1.0" in vf
+
+
+def test_opening_caption_fontfile_honors_env(monkeypatch) -> None:
+    monkeypatch.setenv("AUTOCUT_OPENING_CAPTION_FONT", "/custom/cjk-font.ttc")
+
+    assert _opening_caption_fontfile() == "/custom/cjk-font.ttc"
 
 
 # ── _build_script_system_prompt ──────────────────────────────────────────────

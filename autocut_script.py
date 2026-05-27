@@ -494,6 +494,7 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 
 # ── 4. render ────────────────────────────────────────────────────────
 OUTPUT_LAYOUT_CHOICES = ("landscape", "portrait")
+DEFAULT_OPENING_CAPTION_DURATION = 3.0
 
 
 def _render_layout_filter(layout: str) -> tuple[str, int | None, int | None]:
@@ -521,6 +522,131 @@ def _choose_output_layout(requested_layout: str) -> str:
             f"unknown output layout: {requested_layout}; choose 'landscape' or 'portrait'"
         )
     return requested_layout
+
+
+def _escape_drawtext_text(text: str) -> str:
+    """Escape user text for ffmpeg drawtext's text= value."""
+    return (
+        text.replace("\\", r"\\")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+        .replace("%", r"\%")
+        .replace("\n", r"\n")
+        .replace("\r", "")
+    )
+
+
+def _opening_caption_dimensions(layout: str) -> tuple[int, int]:
+    _, width, height = _render_layout_filter(layout)
+    if width is None or height is None:
+        raise ValueError(f"unknown output layout: {layout}")
+    return width, height
+
+
+def _normalize_opening_caption_duration(duration: float | int | None) -> float:
+    if duration is None:
+        return DEFAULT_OPENING_CAPTION_DURATION
+    duration = float(duration)
+    if duration <= 0:
+        raise ValueError("opening caption duration must be positive")
+    return duration
+
+
+_CJK_FONT_CANDIDATES = (
+    # macOS
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    # Linux
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    # Windows
+    r"C:\\Windows\\Fonts\\msjh.ttc",
+    r"C:\\Windows\\Fonts\\mingliu.ttc",
+    r"C:\\Windows\\Fonts\\simhei.ttf",
+)
+
+
+def _opening_caption_fontfile() -> str | None:
+    """Return a UTF-8/CJK-capable font file for ffmpeg drawtext, if available."""
+    configured = os.environ.get("AUTOCUT_OPENING_CAPTION_FONT", "").strip()
+    if configured:
+        return configured
+    for candidate in _CJK_FONT_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _escape_drawtext_option_value(value: str) -> str:
+    """Escape a generic ffmpeg drawtext option value such as fontfile."""
+    return value.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+
+
+def _opening_caption_drawtext_filter(text: str, *, layout: str) -> str:
+    caption = (text or "").strip()
+    if not caption:
+        raise ValueError("opening caption text is empty")
+    width, _ = _opening_caption_dimensions(layout)
+    font_size = 56 if layout == "portrait" else 42
+    escaped_text = _escape_drawtext_text(caption)
+    fontfile = _opening_caption_fontfile()
+    font_option = ""
+    if fontfile:
+        font_option = f"fontfile='{_escape_drawtext_option_value(fontfile)}':"
+    return (
+        "format=yuv420p,"
+        "drawtext="
+        f"{font_option}"
+        f"text='{escaped_text}':"
+        "fontcolor=white:"
+        f"fontsize={font_size}:"
+        "line_spacing=14:"
+        f"x=(w-text_w)/2:"
+        "y=(h-text_h)/2:"
+        f"box=1:boxcolor=black@1.0:boxborderw=24:"
+        f"fix_bounds=1"
+    )
+
+
+def _render_opening_caption_clip(
+    ffmpeg: str,
+    *,
+    text: str,
+    output_path: str,
+    layout: str,
+    duration: float | int | None = None,
+) -> str:
+    """Create a short white title card matching the script-mode output format."""
+    caption = (text or "").strip()
+    if not caption:
+        raise ValueError("opening caption text is empty")
+    duration = _normalize_opening_caption_duration(duration)
+    width, height = _opening_caption_dimensions(layout)
+    vf = _opening_caption_drawtext_filter(caption, layout=layout)
+    result = subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-f", "lavfi", "-i", f"color=c=white:s={width}x{height}:r=30:d={duration:g}",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-t", f"{duration:g}",
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        raise RuntimeError(result.stderr.strip() or "ffmpeg opening caption render failed")
+    return output_path
 
 
 def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *, layout: str) -> str:
@@ -555,7 +681,9 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *
 
 def render(selected: list[dict], *, output_path: str,
            hq_dir: str | None, output_layout: str,
-           enhance: str = "none", enhance_plan_path: str | None = None) -> None:
+           enhance: str = "none", enhance_plan_path: str | None = None,
+           opening_caption: str | None = None,
+           opening_caption_duration: float | int | None = None) -> None:
     from autocut import convert_clip_to_flat, detect_360_projection
     from sentrysearch.trimmer import trim_clip
 
@@ -573,8 +701,24 @@ def render(selected: list[dict], *, output_path: str,
     enhance_settings = get_enhance_settings(enhance)
     if enhance_settings.preset != "none":
         click.echo(f"  Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
+    opening_caption_text = (opening_caption or "").strip()
+    if opening_caption_text:
+        opening_caption_duration = _normalize_opening_caption_duration(opening_caption_duration)
+        click.echo(f"  Opening caption: {opening_caption_text} ({opening_caption_duration:g}s)")
 
     try:
+        if opening_caption_text:
+            title_path = output_path.replace(".mp4", "_opening_caption.mp4")
+            click.echo("  Rendering opening caption...")
+            _render_opening_caption_clip(
+                ffmpeg,
+                text=opening_caption_text,
+                output_path=title_path,
+                layout=resolved_layout,
+                duration=opening_caption_duration,
+            )
+            clip_files.append(title_path)
+
         for i, s in enumerate(selected):
             clip_path = output_path.replace(".mp4", f"_{i}.mp4")
             trim_source = _resolve_hq_source(s["source_file"], hq_dir=hq_dir) or s["source_file"]
@@ -632,7 +776,12 @@ def render(selected: list[dict], *, output_path: str,
                 input_path=output_path,
                 output_path=output_path,
                 context="script",
-                extra={"clip_count": len(selected), "output_layout": resolved_layout},
+                extra={
+                    "clip_count": len(selected),
+                    "output_layout": resolved_layout,
+                    "opening_caption": opening_caption_text,
+                    "opening_caption_duration": opening_caption_duration if opening_caption_text else None,
+                },
             )
             plan_path = write_enhance_plan(plan, enhance_plan_path)
             click.echo(f"  Enhancement plan: {plan_path}")
@@ -714,6 +863,10 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Optional target final video duration in minutes for the script writer.")
 @click.option("--output-layout", type=click.Choice(OUTPUT_LAYOUT_CHOICES), default="landscape", show_default=True,
               help="Final video shape: landscape (橫式) or portrait (直式).")
+@click.option("--opening-caption", default=None,
+              help="Optional opening caption/title card text to insert before the first clip.")
+@click.option("--opening-caption-duration", default=DEFAULT_OPENING_CAPTION_DURATION, type=float, show_default=True,
+              help="Duration in seconds for --opening-caption.")
 @click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
               help="Apply a final preset-based video/audio enhancement pass.")
 @click.option("--enhance-plan", default=None,
@@ -724,6 +877,7 @@ def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
            script_api_key, script_api_model, script_api_max_tokens,
            catalog_max_chars, target_duration_minutes, output_layout,
+           opening_caption, opening_caption_duration,
            enhance, enhance_plan, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
@@ -793,6 +947,8 @@ def create(videos, prompt, output, backend, model,
         output_layout=output_layout,
         enhance=enhance,
         enhance_plan_path=str(Path(enhance_plan).expanduser().resolve()) if enhance_plan else None,
+        opening_caption=opening_caption,
+        opening_caption_duration=opening_caption_duration,
     )
 
     click.echo(f"\nDone: {output_path}")

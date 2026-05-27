@@ -22,6 +22,8 @@ class AutoTab(BaseTab):
         self.auto_verbose = tk.BooleanVar(value=False)
         self.auto_output_layout = tk.StringVar(value="landscape")
         self.auto_target_duration = tk.StringVar(value="")
+        self.auto_opening_caption = tk.StringVar(value="")
+        self.auto_opening_caption_duration = tk.StringVar(value="3")
         self.auto_script_max_tokens = tk.StringVar(value="")
         self.auto_catalog_max_chars = tk.StringVar(value="")
         self.auto_output = tk.StringVar()
@@ -63,9 +65,18 @@ class AutoTab(BaseTab):
         ttk.Label(aopts, text="目錄字數上限").grid(row=1, column=4, sticky=tk.W, padx=(0, 4), pady=(6, 0))
         ttk.Entry(aopts, textvariable=self.auto_catalog_max_chars,
                   width=10).grid(row=1, column=5, sticky=tk.W, pady=(6, 0))
+        cap = ttk.Frame(self)
+        cap.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(cap, text="開場字幕（可選）", font=("", 11, "bold")).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(cap, text="秒數").grid(row=0, column=1, sticky=tk.E, padx=(12, 4))
+        ttk.Entry(cap, textvariable=self.auto_opening_caption_duration,
+                  width=6).grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(cap, textvariable=self.auto_opening_caption).grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
+        cap.columnconfigure(0, weight=1)
+
         ttk.Label(
             self,
-            text="目錄字數留空＝完整送出；輸出 tokens 留空＝不傳 token 限制（建議）。若模型 context / output 不夠再填上限。",
+            text="開場字幕留空＝不加；目錄字數留空＝完整送出；輸出 tokens 留空＝不傳 token 限制（建議）。",
             font=("", 9), foreground="gray", wraplength=700,
         ).pack(fill=tk.X, pady=(0, 6))
 
@@ -110,6 +121,14 @@ class AutoTab(BaseTab):
         if isinstance(auto_target_duration, str):
             self.auto_target_duration.set(auto_target_duration)
 
+        auto_opening_caption = data.get("auto_opening_caption")
+        if isinstance(auto_opening_caption, str):
+            self.auto_opening_caption.set(auto_opening_caption)
+
+        auto_opening_caption_duration = data.get("auto_opening_caption_duration")
+        if isinstance(auto_opening_caption_duration, str):
+            self.auto_opening_caption_duration.set(auto_opening_caption_duration)
+
         auto_script_max_tokens = data.get("auto_script_max_tokens")
         if isinstance(auto_script_max_tokens, int) and auto_script_max_tokens > 0:
             self.auto_script_max_tokens.set(str(auto_script_max_tokens))
@@ -126,6 +145,8 @@ class AutoTab(BaseTab):
             "auto_output": self.auto_output.get().strip(),
             "auto_output_layout": self.auto_output_layout.get(),
             "auto_target_duration": self.auto_target_duration.get().strip(),
+            "auto_opening_caption": self.auto_opening_caption.get().strip(),
+            "auto_opening_caption_duration": self.auto_opening_caption_duration.get().strip(),
             "auto_script_max_tokens": self.auto_script_max_tokens.get().strip(),
             "auto_catalog_max_chars": self.auto_catalog_max_chars.get().strip(),
         }
@@ -218,6 +239,16 @@ class AutoTab(BaseTab):
                 messagebox.showerror("錯誤", "目錄字數上限必須是正整數，或留空代表完整送出")
                 return
 
+        opening_caption = self.auto_opening_caption.get().strip()
+        opening_caption_duration = self.auto_opening_caption_duration.get().strip()
+        if opening_caption:
+            try:
+                if float(opening_caption_duration or "3") <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("錯誤", "開場字幕秒數必須是正數")
+                return
+
         output = self.auto_output.get().strip()
         if not output:
             output = str(Path.home() / "Movies" / "auto_output.mp4")
@@ -239,6 +270,9 @@ class AutoTab(BaseTab):
             args.extend(["--target-duration-minutes", target_duration])
         if catalog_max_chars:
             args.extend(["--catalog-max-chars", catalog_max_chars])
+        if opening_caption:
+            args.extend(["--opening-caption", opening_caption])
+            args.extend(["--opening-caption-duration", opening_caption_duration or "3"])
         if self.auto_verbose.get():
             args.append("--verbose")
 
@@ -251,6 +285,9 @@ class AutoTab(BaseTab):
         self.app.log(f"  Script max tokens: {script_max_tokens or 'default/API-managed (not sent)'}")
         self.app.log(f"  Target duration: {target_duration or 'auto'} min")
         self.app.log(f"  Catalog limit: {catalog_max_chars or 'unlimited'} chars")
+        self.app.log(f"  Opening caption: {opening_caption or 'none'}")
+        if opening_caption:
+            self.app.log(f"  Opening caption duration: {opening_caption_duration or '3'}s")
         self.app.log(f"  Output: {output}")
         self.app.log("")
 

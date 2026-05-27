@@ -24,6 +24,8 @@ class ScriptTab(BaseTab):
         self.script_prompt = tk.StringVar(value=_DEFAULT_PROMPT)
         self.script_backend = tk.StringVar(value="local-api")
         self.script_verbose = tk.BooleanVar(value=False)
+        self.script_opening_caption = tk.StringVar(value="")
+        self.script_opening_caption_duration = tk.StringVar(value="3")
         self.script_output = tk.StringVar()
         super().__init__(parent, app)
 
@@ -55,6 +57,15 @@ class ScriptTab(BaseTab):
                      state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
         ttk.Checkbutton(sopts, text="詳細日誌",
                         variable=self.script_verbose).grid(row=0, column=2, sticky=tk.W)
+
+        cap = ttk.Frame(self)
+        cap.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(cap, text="開場字幕（可選）", font=("", 11, "bold")).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(cap, text="秒數").grid(row=0, column=1, sticky=tk.E, padx=(12, 4))
+        ttk.Entry(cap, textvariable=self.script_opening_caption_duration,
+                  width=6).grid(row=0, column=2, sticky=tk.W)
+        ttk.Entry(cap, textvariable=self.script_opening_caption).grid(row=1, column=0, columnspan=3, sticky=tk.EW, pady=(4, 0))
+        cap.columnconfigure(0, weight=1)
 
         ro = ttk.Frame(self)
         ro.pack(fill=tk.X, pady=(0, 6))
@@ -109,6 +120,16 @@ class ScriptTab(BaseTab):
             messagebox.showerror("錯誤", "請輸入腳本提示")
             return
 
+        opening_caption = self.script_opening_caption.get().strip()
+        opening_caption_duration = self.script_opening_caption_duration.get().strip()
+        if opening_caption:
+            try:
+                if float(opening_caption_duration or "3") <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("錯誤", "開場字幕秒數必須是正數")
+                return
+
         output = self.script_output.get().strip()
         if not output:
             output = str(Path.home() / "Movies" / "script_output.mp4")
@@ -122,6 +143,9 @@ class ScriptTab(BaseTab):
             "--backend", self.script_backend.get(),
             "-o", output,
         ]
+        if opening_caption:
+            args.extend(["--opening-caption", opening_caption])
+            args.extend(["--opening-caption-duration", opening_caption_duration or "3"])
         if self.script_verbose.get():
             args.append("--verbose")
 
@@ -131,6 +155,9 @@ class ScriptTab(BaseTab):
             self.app.log(f"    {Path(sf).name}")
         self.app.log(f"  Prompt: {prompt}")
         self.app.log(f"  Backend: {self.script_backend.get()}")
+        self.app.log(f"  Opening caption: {opening_caption or 'none'}")
+        if opening_caption:
+            self.app.log(f"  Opening caption duration: {opening_caption_duration or '3'}s")
         self.app.log(f"  Output: {output}")
         self.app.log("")
 
