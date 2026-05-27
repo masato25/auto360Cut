@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 
 from enhancement import (  # noqa: E402
     ENHANCE_PRESETS,
+    apply_audio_normalize,
     apply_enhancement,
     build_enhance_plan,
     get_enhance_settings,
@@ -638,6 +639,9 @@ def render(selected: list[dict], *, output_path: str,
             click.echo(f"  Enhancement plan: {plan_path}")
             click.echo("  Applying enhancement pass...")
             apply_enhancement(ffmpeg, output_path, output_path, preset=enhance_settings.preset)
+        else:
+            click.echo("  Normalising audio loudness...")
+            apply_audio_normalize(ffmpeg, output_path, output_path)
 
         click.secho(f"\n✓ Script edit complete: {output_path}", fg="green", bold=True)
     finally:
