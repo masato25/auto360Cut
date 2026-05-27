@@ -53,7 +53,7 @@ class IndexTab(BaseTab):
             self,
             text="提示：如果只是新增素材，不用勾強制重建；改了 360 視角提示或想刷新舊資料才需要重建。",
             foreground="gray",
-            wraplength=620,
+            wraplength=500,
         ).pack(fill=tk.X, pady=(0, 6))
 
         self._run_btn = ttk.Button(self, text=self.IDLE_LABEL, command=self._run)

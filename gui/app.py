@@ -20,8 +20,8 @@ class AutocutGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("autoCut")
-        self.geometry("760x720")
-        self.minsize(600, 550)
+        self.geometry("1120x720")
+        self.minsize(900, 600)
 
         self._running = False
         self._stopping = False
@@ -46,47 +46,88 @@ class AutocutGUI(tk.Tk):
     def _build_ui(self) -> None:
         main = ttk.Frame(self, padding=16)
         main.pack(fill=tk.BOTH, expand=True)
+        main.columnconfigure(0, weight=3, minsize=520)
+        main.columnconfigure(1, weight=2, minsize=340)
+        main.rowconfigure(0, weight=1)
 
-        notebook = ttk.Notebook(main)
+        # left: workflow controls
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 12))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        header = ttk.Frame(left)
+        header.grid(row=0, column=0, sticky=tk.EW, pady=(0, 10))
+        ttk.Label(header, text="autoCut", font=("", 20, "bold")).pack(anchor=tk.W)
+        ttk.Label(
+            header,
+            text="選擇工作模式、設定素材與輸出後即可開始剪輯",
+            font=("", 10),
+            foreground="gray",
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        notebook = ttk.Notebook(left)
         for cls in [IndexTab, NormalTab, ScriptTab, AutoTab]:
             tab = cls(notebook, self)
             notebook.add(tab, text=cls.TAB_LABEL)
             self._tabs.append(tab)
-        notebook.pack(fill=tk.X, pady=(0, 10))
+        notebook.grid(row=1, column=0, sticky=tk.NSEW)
 
-        # shared progress
-        progress_frame = ttk.Frame(main)
-        progress_frame.pack(fill=tk.X, pady=(0, 8))
-        self.progress_label = ttk.Label(progress_frame, text="狀態：待命", font=("", 10))
-        self.progress_label.pack(side=tk.LEFT)
-        self.progress_bar = ttk.Progressbar(progress_frame, mode="indeterminate")
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 8))
-        self.stop_btn = ttk.Button(
-            progress_frame, text="強制停止", command=self._stop_process, state=tk.DISABLED
+        hint = ttk.Label(
+            left,
+            text="提示：點擊「瀏覽…」選擇影片，或將檔案路徑貼上到欄位中。",
+            font=("", 9),
+            foreground="gray",
         )
-        self.stop_btn.pack(side=tk.RIGHT)
+        hint.grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
 
-        # shared log
-        ttk.Label(main, text="執行紀錄", font=("", 11, "bold")).pack(anchor=tk.W)
-        lf = ttk.Frame(main)
-        lf.pack(fill=tk.BOTH, expand=True)
-        self.log_text = tk.Text(lf, height=10, wrap=tk.WORD, font=("Menlo", 9),
-                                bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
+        # right: run status and shared log
+        right = ttk.Frame(main)
+        right.grid(row=0, column=1, sticky=tk.NSEW)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+
+        status_card = ttk.LabelFrame(right, text="執行狀態", padding=12)
+        status_card.grid(row=0, column=0, sticky=tk.EW, pady=(0, 12))
+        status_card.columnconfigure(1, weight=1)
+        self.progress_label = ttk.Label(status_card, text="狀態：待命", font=("", 11, "bold"))
+        self.progress_label.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        self.progress_bar = ttk.Progressbar(status_card, mode="indeterminate")
+        self.progress_bar.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=(0, 8))
+        self.stop_btn = ttk.Button(
+            status_card, text="強制停止", command=self._stop_process, state=tk.DISABLED
+        )
+        self.stop_btn.grid(row=1, column=2, sticky=tk.E)
+        self.play_btn = ttk.Button(
+            status_card, text="▶ 播放輸出", command=self._play_output, state=tk.DISABLED
+        )
+        self.play_btn.grid(row=2, column=2, sticky=tk.E, pady=(8, 0))
+
+        ttk.Label(right, text="執行紀錄", font=("", 12, "bold")).grid(
+            row=1, column=0, sticky=tk.W, pady=(0, 6)
+        )
+        lf = ttk.Frame(right)
+        lf.grid(row=2, column=0, sticky=tk.NSEW)
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+        self.log_text = tk.Text(
+            lf,
+            height=10,
+            wrap=tk.WORD,
+            font=("Menlo", 10),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="white",
+            relief=tk.FLAT,
+            padx=10,
+            pady=10,
+        )
         self.log_text.configure(state=tk.DISABLED)
         bind_readonly_text_shortcuts(self.log_text)
-        self.log_text.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
         scroll = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.log_text.yview)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll.grid(row=0, column=1, sticky=tk.NS)
         self.log_text.configure(yscrollcommand=scroll.set)
-
-        # footer: hint + play button
-        footer = ttk.Frame(main)
-        footer.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(footer, text="點擊「瀏覽…」選擇影片，或將檔案路徑貼上到上方欄位",
-                  font=("", 9), foreground="gray").pack(side=tk.LEFT)
-        self.play_btn = ttk.Button(footer, text="▶ 播放輸出", command=self._play_output,
-                                   state=tk.DISABLED)
-        self.play_btn.pack(side=tk.RIGHT)
 
         # load persisted state after log widget is available
         for tab in self._tabs:

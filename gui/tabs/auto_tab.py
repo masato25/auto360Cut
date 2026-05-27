@@ -77,7 +77,7 @@ class AutoTab(BaseTab):
         ttk.Label(
             self,
             text="開場字幕留空＝不加；目錄字數留空＝完整送出；輸出 tokens 留空＝不傳 token 限制（建議）。",
-            font=("", 9), foreground="gray", wraplength=700,
+            font=("", 9), foreground="gray", wraplength=520,
         ).pack(fill=tk.X, pady=(0, 6))
 
         ro = ttk.Frame(self)

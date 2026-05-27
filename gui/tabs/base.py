@@ -8,7 +8,7 @@ class BaseTab(ttk.Frame):
     IDLE_LABEL = "▶ Run"
 
     def __init__(self, parent, app):
-        super().__init__(parent)
+        super().__init__(parent, padding=12)
         self.app = app
         self._run_btn: ttk.Button | None = None
         self._build()
