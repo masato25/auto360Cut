@@ -1,0 +1,3 @@
+# 360 Video Converter
+# tkinter 為 Python 內建模組，無需 pip 安裝
+# 只需要 FFmpeg (ffmpeg -version)
