@@ -76,7 +76,7 @@ class AutoTab(BaseTab):
 
         ttk.Label(
             self,
-            text="開場/閉場字幕留空＝不加；字幕秒數預設 3 秒，可用 .env 的 AUTOCUT_CAPTION_DURATION_SECONDS 調整；目標長度留空＝AI 自行決定片長；音樂資料夾與音量可在「設定」頁籤調整。",
+            text="開場/閉場字幕留空＝不加；字幕秒數預設 3 秒，可用 .env 的 AUTOCUT_CAPTION_DURATION_SECONDS 調整；Band、音樂資料夾與音量可在「設定」頁籤調整；目標長度留空＝AI 自行決定片長。",
             font=("", 9), foreground="gray", wraplength=520,
         ).pack(fill=tk.X, pady=(0, 6))
 
@@ -255,6 +255,7 @@ class AutoTab(BaseTab):
         self.app.log(f"  Target duration: {target_duration or 'auto'} min")
         self.app.log(f"  Opening caption: {opening_caption or 'none'}")
         self.app.log(f"  Closing caption: {closing_caption or 'none'}")
+        self.app.log("  Band: from .env AUTOCUT_BAND_TEXT")
         self.app.log(f"  Auto music: {'yes' if self.auto_music.get() else 'no'}")
         if opening_caption or closing_caption:
             self.app.log("  Caption duration: from .env AUTOCUT_CAPTION_DURATION_SECONDS (default 3s)")

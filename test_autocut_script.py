@@ -9,6 +9,7 @@ from autocut_script import (
     _coerce_script_response,
     _escape_drawtext_text,
     _opening_caption_drawtext_filter,
+    _band_caption_drawtext_filter,
     _opening_caption_fontfile,
     _normalize_opening_caption_duration,
     _music_candidates,
@@ -86,6 +87,18 @@ def test_opening_caption_drawtext_filter_uses_boxed_white_text(monkeypatch) -> N
     assert "fontcolor=white" in vf
     assert "box=1" in vf
     assert "boxcolor=black@1.0" in vf
+
+
+def test_band_caption_drawtext_filter_uses_bottom_right_and_custom_box_color(monkeypatch) -> None:
+    monkeypatch.setenv("AUTOCUT_OPENING_CAPTION_FONT", "/tmp/Noto Sans CJK.ttc")
+
+    vf = _band_caption_drawtext_filter("Channel A", layout="landscape", box_color="blue@0.7")
+
+    assert "text='Channel A'" in vf
+    assert "x=w-text_w-48" in vf
+    assert "y=h-text_h-48" in vf
+    assert "fontsize=30" in vf
+    assert "boxcolor=blue@0.7" in vf
 
 
 def test_opening_caption_fontfile_honors_env(monkeypatch) -> None:
@@ -345,7 +358,8 @@ def test_normalize_music_volume_default_and_rejects_negative(monkeypatch) -> Non
 # ── render caption ordering ─────────────────────────────────────────────────
 
 
-def test_render_appends_closing_caption_after_clips(monkeypatch, tmp_path) -> None:
+def test_render_env_band_text_applies_to_opening_and_closing(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AUTOCUT_BAND_TEXT", "Channel")
     rendered_titles = []
     normalized = []
     concat_files = []
@@ -354,8 +368,8 @@ def test_render_appends_closing_caption_after_clips(monkeypatch, tmp_path) -> No
     def fake_get_ffmpeg() -> str:
         return "ffmpeg"
 
-    def fake_render_caption(ffmpeg, *, text, output_path, layout, duration=None):
-        rendered_titles.append((text, output_path, duration))
+    def fake_render_caption(ffmpeg, *, text, output_path, layout, duration=None, band_text=None, band_box_color=None):
+        rendered_titles.append((text, output_path, duration, band_text, band_box_color))
         Path(output_path).write_text(text, encoding="utf-8")
         return output_path
 
@@ -415,6 +429,9 @@ def test_render_appends_closing_caption_after_clips(monkeypatch, tmp_path) -> No
         opening_caption_duration=1.5,
         closing_caption="End",
         closing_caption_duration=2.5,
+        opening_band="Channel",
+        closing_band="Subscribe",
+        band_box_color="blue@0.7",
         auto_music=True,
         music_dir=str(music_dir),
         music_volume=0.25,
@@ -422,7 +439,10 @@ def test_render_appends_closing_caption_after_clips(monkeypatch, tmp_path) -> No
 
     # Opening/closing captions intentionally share one duration; if both legacy
     # args are passed, opening_caption_duration wins for compatibility.
-    assert rendered_titles == [("Start", str(tmp_path / "out_opening_caption.mp4"), 1.5), ("End", str(tmp_path / "out_closing_caption.mp4"), 1.5)]
+    assert rendered_titles == [
+        ("Start", str(tmp_path / "out_opening_caption.mp4"), 1.5, "Channel", "blue@0.7"),
+        ("End", str(tmp_path / "out_closing_caption.mp4"), 1.5, "Channel", "blue@0.7"),
+    ]
     assert concat_files == [str(tmp_path / "out_opening_caption.mp4"), str(tmp_path / "out_0_norm.mp4"), str(tmp_path / "out_closing_caption.mp4")]
     assert len(mixed_music) == 1
     assert mixed_music[0][1] == str(tmp_path / "out_music.mp4")

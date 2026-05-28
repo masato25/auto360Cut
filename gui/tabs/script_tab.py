@@ -171,6 +171,7 @@ class ScriptTab(BaseTab):
         self.app.log("  Backend: from .env AUTOCUT_BACKEND")
         self.app.log(f"  Opening caption: {opening_caption or 'none'}")
         self.app.log(f"  Closing caption: {closing_caption or 'none'}")
+        self.app.log("  Band: from .env AUTOCUT_BAND_TEXT")
         self.app.log(f"  Auto music: {'yes' if self.script_auto_music.get() else 'no'}")
         if opening_caption or closing_caption:
             self.app.log("  Caption duration: from .env AUTOCUT_CAPTION_DURATION_SECONDS (default 3s)")

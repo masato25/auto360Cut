@@ -75,7 +75,7 @@ class SettingsTab(BaseTab):
             self,
             text=(
                 "小提醒：一鍵腳本/腳本模式會使用這裡的預設後端；一般剪輯與索引頁籤仍可用下拉選單臨時覆蓋。"
-                "這裡也可設定 API 位址、模型、字幕秒數、背景音樂與詳細日誌。"
+                "這裡也可設定 API 位址、模型、字幕秒數、Band、背景音樂與詳細日誌。"
             ),
             font=("", 9),
             foreground="gray",
@@ -119,6 +119,9 @@ class SettingsTab(BaseTab):
             except ValueError:
                 messagebox.showerror("錯誤", "字幕秒數必須是正數")
                 return
+        if values.get("AUTOCUT_BAND_BOX_COLOR") and not values["AUTOCUT_BAND_BOX_COLOR"].strip():
+            messagebox.showerror("錯誤", "Band 背景色不可只填空白；可留空使用預設 black@1.0")
+            return
         if values.get("AUTOCUT_SCRIPT_API_MAX_TOKENS"):
             try:
                 if int(values["AUTOCUT_SCRIPT_API_MAX_TOKENS"]) <= 0:

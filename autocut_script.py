@@ -496,7 +496,10 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 # ── 4. render ────────────────────────────────────────────────────────
 OUTPUT_LAYOUT_CHOICES = ("landscape", "portrait")
 CAPTION_DURATION_ENV = "AUTOCUT_CAPTION_DURATION_SECONDS"
+BAND_TEXT_ENV = "AUTOCUT_BAND_TEXT"
+BAND_BOX_COLOR_ENV = "AUTOCUT_BAND_BOX_COLOR"
 DEFAULT_CAPTION_DURATION = 3.0
+DEFAULT_BAND_BOX_COLOR = "black@1.0"
 MUSIC_DIR_ENV = "AUTOCUT_MUSIC_DIR"
 DEFAULT_MUSIC_VOLUME = 0.18
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif"}
@@ -609,17 +612,29 @@ def _escape_drawtext_option_value(value: str) -> str:
     return value.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
 
 
-def _opening_caption_drawtext_filter(text: str, *, layout: str) -> str:
+def _caption_drawtext_filter(text: str, *, layout: str, position: str = "center", box_color: str | None = None) -> str:
     caption = (text or "").strip()
     if not caption:
-        raise ValueError("opening caption text is empty")
-    width, _ = _opening_caption_dimensions(layout)
+        raise ValueError("caption text is empty")
+    if position not in {"center", "bottom-right"}:
+        raise ValueError(f"unknown caption position: {position}")
     font_size = 56 if layout == "portrait" else 42
+    border_width = 24
+    if position == "bottom-right":
+        # Smaller channel/name band in the lower-right corner.
+        font_size = 42 if layout == "portrait" else 30
+        border_width = 16
+        x_expr = "w-text_w-48"
+        y_expr = "h-text_h-48"
+    else:
+        x_expr = "(w-text_w)/2"
+        y_expr = "(h-text_h)/2"
     escaped_text = _escape_drawtext_text(caption)
     fontfile = _opening_caption_fontfile()
     font_option = ""
     if fontfile:
         font_option = f"fontfile='{_escape_drawtext_option_value(fontfile)}':"
+    box_color = (box_color or DEFAULT_BAND_BOX_COLOR).strip() or DEFAULT_BAND_BOX_COLOR
     return (
         "format=yuv420p,"
         "drawtext="
@@ -628,11 +643,19 @@ def _opening_caption_drawtext_filter(text: str, *, layout: str) -> str:
         "fontcolor=white:"
         f"fontsize={font_size}:"
         "line_spacing=14:"
-        f"x=(w-text_w)/2:"
-        "y=(h-text_h)/2:"
-        f"box=1:boxcolor=black@1.0:boxborderw=24:"
+        f"x={x_expr}:"
+        f"y={y_expr}:"
+        f"box=1:boxcolor={_escape_drawtext_option_value(box_color)}:boxborderw={border_width}:"
         f"fix_bounds=1"
     )
+
+
+def _opening_caption_drawtext_filter(text: str, *, layout: str) -> str:
+    return _caption_drawtext_filter(text, layout=layout, position="center", box_color="black@1.0")
+
+
+def _band_caption_drawtext_filter(text: str, *, layout: str, box_color: str | None = None) -> str:
+    return _caption_drawtext_filter(text, layout=layout, position="bottom-right", box_color=box_color)
 
 
 def _render_opening_caption_clip(
@@ -642,14 +665,20 @@ def _render_opening_caption_clip(
     output_path: str,
     layout: str,
     duration: float | int | None = None,
+    band_text: str | None = None,
+    band_box_color: str | None = None,
 ) -> str:
-    """Create a short white title card matching the script-mode output format."""
+    """Create a short white title/closing card matching the script-mode output format."""
     caption = (text or "").strip()
     if not caption:
         raise ValueError("opening caption text is empty")
     duration = _normalize_opening_caption_duration(duration)
     width, height = _opening_caption_dimensions(layout)
-    vf = _opening_caption_drawtext_filter(caption, layout=layout)
+    filters = [_opening_caption_drawtext_filter(caption, layout=layout)]
+    band = (band_text or "").strip()
+    if band:
+        filters.append(_band_caption_drawtext_filter(band, layout=layout, box_color=band_box_color))
+    vf = ",".join(filters)
     result = subprocess.run(
         [
             ffmpeg, "-y",
@@ -790,6 +819,9 @@ def render(selected: list[dict], *, output_path: str,
            opening_caption_duration: float | int | None = None,
            closing_caption: str | None = None,
            closing_caption_duration: float | int | None = None,
+           opening_band: str | None = None,
+           closing_band: str | None = None,
+           band_box_color: str | None = None,
            auto_music: bool = False,
            music_dir: str | None = None,
            music_volume: float | int | str | None = None) -> None:
@@ -811,6 +843,13 @@ def render(selected: list[dict], *, output_path: str,
         click.echo(f"  Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
     opening_caption_text = (opening_caption or "").strip()
     closing_caption_text = (closing_caption or "").strip()
+    env_band_text = os.environ.get(BAND_TEXT_ENV, "").strip()
+    # AUTOCUT_BAND_TEXT is the current single source for the lower-right band:
+    # once set, both opening and closing caption cards use the same band text.
+    # Legacy CLI/API arguments still work only when the shared env setting is empty.
+    opening_band_text = env_band_text or (opening_band or "").strip()
+    closing_band_text = env_band_text or (closing_band or "").strip()
+    resolved_band_box_color = (band_box_color or os.environ.get(BAND_BOX_COLOR_ENV, "").strip() or DEFAULT_BAND_BOX_COLOR)
     caption_duration: float | None = None
     if opening_caption_text or closing_caption_text:
         # One shared setting for both opening and closing captions.  GUI/CLI do
@@ -824,6 +863,12 @@ def render(selected: list[dict], *, output_path: str,
     if closing_caption_text:
         closing_caption_duration = caption_duration
         click.echo(f"  Closing caption: {closing_caption_text} ({closing_caption_duration:g}s)")
+    if opening_band_text or closing_band_text:
+        click.echo(f"  Band box color: {resolved_band_box_color}")
+        if opening_band_text:
+            click.echo(f"  Opening band: {opening_band_text}")
+        if closing_band_text:
+            click.echo(f"  Closing band: {closing_band_text}")
     selected_music: str | None = None
     if auto_music:
         selected_music = _select_music_file(
@@ -850,6 +895,8 @@ def render(selected: list[dict], *, output_path: str,
                 output_path=title_path,
                 layout=resolved_layout,
                 duration=opening_caption_duration,
+                band_text=opening_band_text,
+                band_box_color=resolved_band_box_color,
             )
             clip_files.append(title_path)
 
@@ -898,6 +945,8 @@ def render(selected: list[dict], *, output_path: str,
                 output_path=closing_path,
                 layout=resolved_layout,
                 duration=closing_caption_duration,
+                band_text=closing_band_text,
+                band_box_color=resolved_band_box_color,
             )
             clip_files.append(closing_path)
 
@@ -944,6 +993,9 @@ def render(selected: list[dict], *, output_path: str,
                     "opening_caption_duration": opening_caption_duration if opening_caption_text else None,
                     "closing_caption": closing_caption_text,
                     "closing_caption_duration": closing_caption_duration if closing_caption_text else None,
+                    "opening_band": opening_band_text,
+                    "closing_band": closing_band_text,
+                    "band_box_color": resolved_band_box_color if (opening_band_text or closing_band_text) else None,
                     "auto_music": bool(selected_music),
                     "music_file": selected_music,
                     "music_volume": _normalize_music_volume(music_volume) if selected_music else None,
@@ -1037,6 +1089,12 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Optional closing caption/title card text to append after the last clip.")
 @click.option("--closing-caption-duration", default=None, type=float, hidden=True,
               help="Deprecated. Caption duration is now shared via AUTOCUT_CAPTION_DURATION_SECONDS.")
+@click.option("--opening-band", default=None, hidden=True,
+              help="Deprecated: use .env AUTOCUT_BAND_TEXT. If AUTOCUT_BAND_TEXT is set, it applies to opening and closing cards.")
+@click.option("--closing-band", default=None, hidden=True,
+              help="Deprecated: use .env AUTOCUT_BAND_TEXT. If AUTOCUT_BAND_TEXT is set, it applies to opening and closing cards.")
+@click.option("--band-box-color", default=None,
+              help=f"FFmpeg drawtext box color for opening/closing band. Default: {BAND_BOX_COLOR_ENV} or {DEFAULT_BAND_BOX_COLOR}.")
 @click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
               help="Apply a final preset-based video/audio enhancement pass.")
 @click.option("--enhance-plan", default=None,
@@ -1056,6 +1114,7 @@ def create(videos, prompt, output, backend, model,
            catalog_max_chars, target_duration_minutes, output_layout,
            opening_caption, opening_caption_duration,
            closing_caption, closing_caption_duration,
+           opening_band, closing_band, band_box_color,
            enhance, enhance_plan, auto_music, music_dir, music_volume, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
@@ -1129,6 +1188,9 @@ def create(videos, prompt, output, backend, model,
         opening_caption_duration=opening_caption_duration,
         closing_caption=closing_caption,
         closing_caption_duration=closing_caption_duration,
+        opening_band=opening_band,
+        closing_band=closing_band,
+        band_box_color=band_box_color,
         auto_music=auto_music,
         music_dir=music_dir,
         music_volume=music_volume,
