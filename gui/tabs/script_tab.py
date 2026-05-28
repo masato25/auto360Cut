@@ -26,6 +26,7 @@ class ScriptTab(BaseTab):
         self.script_prompt = tk.StringVar(value=_DEFAULT_PROMPT)
         self.script_opening_caption = tk.StringVar(value="")
         self.script_closing_caption = tk.StringVar(value="")
+        self.script_auto_music = tk.BooleanVar(value=False)
         self.script_output = tk.StringVar()
         super().__init__(parent, app)
 
@@ -63,6 +64,19 @@ class ScriptTab(BaseTab):
         ttk.Label(ccap, text="閉場字幕（可選）", font=("", 11, "bold")).grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(ccap, textvariable=self.script_closing_caption).grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
         ccap.columnconfigure(0, weight=1)
+
+        music = ttk.Frame(self)
+        music.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(
+            music,
+            text="自動選擇背景音樂（從設定的音樂資料夾）",
+            variable=self.script_auto_music,
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            music,
+            text="音樂資料夾與音量可在「設定」頁籤調整；未設定或找不到音樂時會略過。",
+            font=("", 9), foreground="gray", wraplength=520,
+        ).pack(anchor=tk.W, pady=(2, 0))
 
         ro = ttk.Frame(self)
         ro.pack(fill=tk.X, pady=(0, 6))
@@ -143,6 +157,8 @@ class ScriptTab(BaseTab):
             args.extend(["--opening-caption", opening_caption])
         if closing_caption:
             args.extend(["--closing-caption", closing_caption])
+        if self.script_auto_music.get():
+            args.append("--auto-music")
         verbose_enabled = is_verbose_enabled()
         if verbose_enabled:
             args.append("--verbose")
@@ -155,6 +171,7 @@ class ScriptTab(BaseTab):
         self.app.log("  Backend: from .env AUTOCUT_BACKEND")
         self.app.log(f"  Opening caption: {opening_caption or 'none'}")
         self.app.log(f"  Closing caption: {closing_caption or 'none'}")
+        self.app.log(f"  Auto music: {'yes' if self.script_auto_music.get() else 'no'}")
         if opening_caption or closing_caption:
             self.app.log("  Caption duration: from .env AUTOCUT_CAPTION_DURATION_SECONDS (default 3s)")
         self.app.log(f"  Output: {output}")

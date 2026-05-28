@@ -23,6 +23,8 @@ ENV_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("AUTOCUT_SCRIPT_API_MODEL", "腳本 API Model", ""),
     ("AUTOCUT_SCRIPT_API_MAX_TOKENS", "腳本 Max Tokens", ""),
     ("AUTOCUT_CAPTION_DURATION_SECONDS", "字幕秒數", "3"),
+    ("AUTOCUT_MUSIC_DIR", "音樂資料夾", ""),
+    ("AUTOCUT_MUSIC_VOLUME", "背景音樂音量", "0.18"),
     ("AUTOCUT_OPENING_CAPTION_FONT", "字幕字型檔", ""),
     ("AUTOCUT_VERBOSE", "詳細日誌", "true"),
 )

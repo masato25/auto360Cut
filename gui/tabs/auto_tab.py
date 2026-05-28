@@ -20,11 +20,11 @@ class AutoTab(BaseTab):
 
     def __init__(self, parent, app):
         self.auto_files: list[str] = []
-        self.auto_backend = tk.StringVar(value="local-api")
         self.auto_output_layout = tk.StringVar(value="landscape")
         self.auto_target_duration = tk.StringVar(value="")
         self.auto_opening_caption = tk.StringVar(value="")
         self.auto_closing_caption = tk.StringVar(value="")
+        self.auto_music = tk.BooleanVar(value=True)
         self.auto_output = tk.StringVar()
         super().__init__(parent, app)
 
@@ -47,17 +47,13 @@ class AutoTab(BaseTab):
 
         aopts = ttk.Frame(self)
         aopts.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(aopts, text="後端").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
-        ttk.Combobox(aopts, textvariable=self.auto_backend,
-                     values=["local-api", "local", "qwen-cloud", "gemini"],
-                     state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
-        ttk.Label(aopts, text="輸出版型").grid(row=0, column=2, sticky=tk.W, padx=(0, 4))
+        ttk.Label(aopts, text="輸出版型").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
         ttk.Combobox(aopts, textvariable=self.auto_output_layout,
                      values=["landscape", "portrait"],
-                     state="readonly", width=10).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
-        ttk.Label(aopts, text="目標長度(分)").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(6, 0))
+                     state="readonly", width=10).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
+        ttk.Label(aopts, text="目標長度(分)").grid(row=0, column=2, sticky=tk.W, padx=(0, 4))
         ttk.Entry(aopts, textvariable=self.auto_target_duration,
-                  width=8).grid(row=1, column=1, sticky=tk.W, padx=(0, 20), pady=(6, 0))
+                  width=8).grid(row=0, column=3, sticky=tk.W, padx=(0, 20))
         cap = ttk.Frame(self)
         cap.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(cap, text="開場字幕（可選）", font=("", 11, "bold")).grid(row=0, column=0, sticky=tk.W)
@@ -70,9 +66,17 @@ class AutoTab(BaseTab):
         ttk.Entry(ccap, textvariable=self.auto_closing_caption).grid(row=1, column=0, sticky=tk.EW, pady=(4, 0))
         ccap.columnconfigure(0, weight=1)
 
+        music = ttk.Frame(self)
+        music.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(
+            music,
+            text="自動選擇背景音樂（從設定的音樂資料夾）",
+            variable=self.auto_music,
+        ).pack(anchor=tk.W)
+
         ttk.Label(
             self,
-            text="開場/閉場字幕留空＝不加；字幕秒數預設 3 秒，可用 .env 的 AUTOCUT_CAPTION_DURATION_SECONDS 調整；目標長度留空＝AI 自行決定片長。",
+            text="開場/閉場字幕留空＝不加；字幕秒數預設 3 秒，可用 .env 的 AUTOCUT_CAPTION_DURATION_SECONDS 調整；目標長度留空＝AI 自行決定片長；音樂資料夾與音量可在「設定」頁籤調整。",
             font=("", 9), foreground="gray", wraplength=520,
         ).pack(fill=tk.X, pady=(0, 6))
 
@@ -125,6 +129,10 @@ class AutoTab(BaseTab):
         if isinstance(auto_closing_caption, str):
             self.auto_closing_caption.set(auto_closing_caption)
 
+        auto_music = data.get("auto_music")
+        if isinstance(auto_music, bool):
+            self.auto_music.set(auto_music)
+
     def save_state(self) -> None:
         data = {
             "auto_files": self.auto_files,
@@ -133,6 +141,7 @@ class AutoTab(BaseTab):
             "auto_target_duration": self.auto_target_duration.get().strip(),
             "auto_opening_caption": self.auto_opening_caption.get().strip(),
             "auto_closing_caption": self.auto_closing_caption.get().strip(),
+            "auto_music": self.auto_music.get(),
         }
         try:
             _STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -222,7 +231,6 @@ class AutoTab(BaseTab):
             str(_ROOT / "autocut_script.py"), "create",
             *self.auto_files,
             "--auto-prompt",
-            "--backend", self.auto_backend.get(),
             "--output-layout", self.auto_output_layout.get(),
             "-o", output,
         ]
@@ -232,6 +240,8 @@ class AutoTab(BaseTab):
             args.extend(["--opening-caption", opening_caption])
         if closing_caption:
             args.extend(["--closing-caption", closing_caption])
+        if self.auto_music.get():
+            args.append("--auto-music")
         verbose_enabled = is_verbose_enabled()
         if verbose_enabled:
             args.append("--verbose")
@@ -240,11 +250,12 @@ class AutoTab(BaseTab):
         self.app.log(f"▶ 一鍵腳本剪輯: {len(self.auto_files)} 部素材")
         for sf in self.auto_files:
             self.app.log(f"    {Path(sf).name}")
-        self.app.log(f"  Backend: {self.auto_backend.get()}")
+        self.app.log("  Backend: from .env AUTOCUT_BACKEND")
         self.app.log(f"  Layout: {self.auto_output_layout.get()}")
         self.app.log(f"  Target duration: {target_duration or 'auto'} min")
         self.app.log(f"  Opening caption: {opening_caption or 'none'}")
         self.app.log(f"  Closing caption: {closing_caption or 'none'}")
+        self.app.log(f"  Auto music: {'yes' if self.auto_music.get() else 'no'}")
         if opening_caption or closing_caption:
             self.app.log("  Caption duration: from .env AUTOCUT_CAPTION_DURATION_SECONDS (default 3s)")
         self.app.log(f"  Output: {output}")

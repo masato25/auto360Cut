@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -496,6 +497,9 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 OUTPUT_LAYOUT_CHOICES = ("landscape", "portrait")
 CAPTION_DURATION_ENV = "AUTOCUT_CAPTION_DURATION_SECONDS"
 DEFAULT_CAPTION_DURATION = 3.0
+MUSIC_DIR_ENV = "AUTOCUT_MUSIC_DIR"
+DEFAULT_MUSIC_VOLUME = 0.18
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif"}
 # Backward-compatible name for older callers/tests.
 DEFAULT_OPENING_CAPTION_DURATION = DEFAULT_CAPTION_DURATION
 
@@ -666,6 +670,89 @@ def _render_opening_caption_clip(
     return output_path
 
 
+def _music_candidates(music_dir: str | None = None) -> list[str]:
+    """Return supported audio files from the configured music directory."""
+    directory = (music_dir or os.environ.get(MUSIC_DIR_ENV, "")).strip()
+    if not directory:
+        return []
+    root = Path(directory).expanduser()
+    if not root.is_dir():
+        return []
+    files = [
+        str(path.resolve())
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+    return sorted(files, key=lambda p: p.lower())
+
+
+def _select_music_file(
+    *,
+    selected: list[dict],
+    output_path: str,
+    music_dir: str | None = None,
+) -> str | None:
+    """Pick a deterministic music file for this edit.
+
+    The selection is automatic but stable: the same clip list/output name maps to
+    the same track, while different edits tend to rotate through the library.
+    """
+    candidates = _music_candidates(music_dir)
+    if not candidates:
+        return None
+    seed_parts = [os.path.basename(output_path)]
+    for clip in selected:
+        seed_parts.append(str(clip.get("source_file", "")))
+        seed_parts.append(str(clip.get("start_time", "")))
+        seed_parts.append(str(clip.get("end_time", "")))
+    digest = hashlib.sha256("|".join(seed_parts).encode("utf-8")).hexdigest()
+    return candidates[int(digest[:12], 16) % len(candidates)]
+
+
+def _normalize_music_volume(volume: float | int | str | None) -> float:
+    raw = volume
+    if raw is None:
+        raw = os.environ.get("AUTOCUT_MUSIC_VOLUME", "").strip() or DEFAULT_MUSIC_VOLUME
+    try:
+        normalized = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AUTOCUT_MUSIC_VOLUME must be a non-negative number") from exc
+    if normalized < 0:
+        raise ValueError("AUTOCUT_MUSIC_VOLUME must be non-negative")
+    return normalized
+
+
+def _apply_background_music(
+    ffmpeg: str,
+    input_path: str,
+    output_path: str,
+    music_path: str,
+    *,
+    volume: float | int | str | None = None,
+) -> str:
+    """Mix selected music under the existing video audio, looping to output duration."""
+    music_volume = _normalize_music_volume(volume)
+    result = subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-i", input_path,
+            "-stream_loop", "-1", "-i", music_path,
+            "-filter_complex",
+            f"[1:a]volume={music_volume:g}[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]",
+            "-map", "0:v:0", "-map", "[a]",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        raise RuntimeError(result.stderr.strip() or "ffmpeg background music mix failed")
+    return output_path
+
+
 def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *, layout: str) -> str:
     """Re-encode a clip to one stable format before concat.
 
@@ -702,7 +789,10 @@ def render(selected: list[dict], *, output_path: str,
            opening_caption: str | None = None,
            opening_caption_duration: float | int | None = None,
            closing_caption: str | None = None,
-           closing_caption_duration: float | int | None = None) -> None:
+           closing_caption_duration: float | int | None = None,
+           auto_music: bool = False,
+           music_dir: str | None = None,
+           music_volume: float | int | str | None = None) -> None:
     from sentrysearch.trimmer import trim_clip
 
     ffmpeg = _get_ffmpeg()
@@ -734,6 +824,21 @@ def render(selected: list[dict], *, output_path: str,
     if closing_caption_text:
         closing_caption_duration = caption_duration
         click.echo(f"  Closing caption: {closing_caption_text} ({closing_caption_duration:g}s)")
+    selected_music: str | None = None
+    if auto_music:
+        selected_music = _select_music_file(
+            selected=selected,
+            output_path=output_path,
+            music_dir=music_dir,
+        )
+        if selected_music:
+            click.echo(f"  Auto music: {os.path.basename(selected_music)}")
+        else:
+            directory = (music_dir or os.environ.get(MUSIC_DIR_ENV, "")).strip()
+            if directory:
+                click.echo(f"  ⚠ Auto music enabled but no supported audio files found in: {directory}", err=True)
+            else:
+                click.echo(f"  ⚠ Auto music enabled but {MUSIC_DIR_ENV} is not set.", err=True)
 
     try:
         if opening_caption_text:
@@ -813,6 +918,19 @@ def render(selected: list[dict], *, output_path: str,
         if result.returncode != 0 or not os.path.isfile(output_path):
             raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
 
+        if selected_music:
+            music_output_path = output_path.replace(".mp4", "_music.mp4")
+            temp_files.append(music_output_path)
+            click.echo("  Mixing background music...")
+            _apply_background_music(
+                ffmpeg,
+                output_path,
+                music_output_path,
+                selected_music,
+                volume=music_volume,
+            )
+            os.replace(music_output_path, output_path)
+
         if enhance_settings.preset != "none":
             plan = build_enhance_plan(
                 preset=enhance_settings.preset,
@@ -826,6 +944,9 @@ def render(selected: list[dict], *, output_path: str,
                     "opening_caption_duration": opening_caption_duration if opening_caption_text else None,
                     "closing_caption": closing_caption_text,
                     "closing_caption_duration": closing_caption_duration if closing_caption_text else None,
+                    "auto_music": bool(selected_music),
+                    "music_file": selected_music,
+                    "music_volume": _normalize_music_volume(music_volume) if selected_music else None,
                 },
             )
             plan_path = write_enhance_plan(plan, enhance_plan_path)
@@ -921,6 +1042,13 @@ def index_command(videos, backend, model, force_reindex, verbose):
 @click.option("--enhance-plan", default=None,
               type=click.Path(dir_okay=False),
               help="Write enhancement plan JSON here. Defaults to OUTPUT.enhance-plan.json when --enhance is used.")
+@click.option("--auto-music", is_flag=True,
+              help=f"Automatically choose background music from {MUSIC_DIR_ENV}.")
+@click.option("--music-dir", default=None, hidden=True,
+              type=click.Path(exists=True, file_okay=False),
+              help=f"Directory of music files. Defaults to {MUSIC_DIR_ENV}.")
+@click.option("--music-volume", default=None, type=float, hidden=True,
+              help=f"Background music volume multiplier. Default: AUTOCUT_MUSIC_VOLUME or {DEFAULT_MUSIC_VOLUME:g}.")
 @click.option("--verbose", is_flag=True)
 def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
@@ -928,7 +1056,7 @@ def create(videos, prompt, output, backend, model,
            catalog_max_chars, target_duration_minutes, output_layout,
            opening_caption, opening_caption_duration,
            closing_caption, closing_caption_duration,
-           enhance, enhance_plan, verbose):
+           enhance, enhance_plan, auto_music, music_dir, music_volume, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
     model = model or _auto_model()
@@ -1001,6 +1129,9 @@ def create(videos, prompt, output, backend, model,
         opening_caption_duration=opening_caption_duration,
         closing_caption=closing_caption,
         closing_caption_duration=closing_caption_duration,
+        auto_music=auto_music,
+        music_dir=music_dir,
+        music_volume=music_volume,
     )
 
     click.echo(f"\nDone: {output_path}")

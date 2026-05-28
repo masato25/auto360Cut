@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
 
 from .base import BaseTab
 from ..settings import ENV_FIELDS, ENV_PATH, load_env_values, write_env_values
@@ -52,12 +53,13 @@ class SettingsTab(BaseTab):
                     width=10,
                 )
                 widget.grid(row=row, column=1, sticky=tk.W, pady=4)
-            elif key == "AUTOCUT_OPENING_CAPTION_FONT":
+            elif key in {"AUTOCUT_OPENING_CAPTION_FONT", "AUTOCUT_MUSIC_DIR"}:
                 line = ttk.Frame(form)
                 line.grid(row=row, column=1, sticky=tk.EW, pady=4)
                 line.columnconfigure(0, weight=1)
                 ttk.Entry(line, textvariable=var).grid(row=0, column=0, sticky=tk.EW)
-                ttk.Button(line, text="選擇…", command=self._browse_font).grid(row=0, column=1, padx=(6, 0))
+                browse = self._browse_font if key == "AUTOCUT_OPENING_CAPTION_FONT" else self._browse_music_dir
+                ttk.Button(line, text="選擇…", command=browse).grid(row=0, column=1, padx=(6, 0))
             else:
                 ttk.Entry(form, textvariable=var).grid(row=row, column=1, sticky=tk.EW, pady=4)
             ttk.Label(form, text=key, foreground="gray", font=("Menlo", 9)).grid(
@@ -72,8 +74,8 @@ class SettingsTab(BaseTab):
         ttk.Label(
             self,
             text=(
-                "小提醒：一般剪輯/一鍵腳本頁籤的『後端』下拉選單仍可覆蓋預設後端；"
-                "這裡主要設定 API 位址、模型、字幕秒數與詳細日誌。"
+                "小提醒：一鍵腳本/腳本模式會使用這裡的預設後端；一般剪輯與索引頁籤仍可用下拉選單臨時覆蓋。"
+                "這裡也可設定 API 位址、模型、字幕秒數、背景音樂與詳細日誌。"
             ),
             font=("", 9),
             foreground="gray",
@@ -103,6 +105,11 @@ class SettingsTab(BaseTab):
         if f:
             self._vars["AUTOCUT_OPENING_CAPTION_FONT"].set(f)
 
+    def _browse_music_dir(self) -> None:
+        d = filedialog.askdirectory(title="選擇背景音樂資料夾")
+        if d:
+            self._vars["AUTOCUT_MUSIC_DIR"].set(d)
+
     def _save(self) -> None:
         values = {key: var.get().strip() for key, var in self._vars.items()}
         if values.get("AUTOCUT_CAPTION_DURATION_SECONDS"):
@@ -119,6 +126,16 @@ class SettingsTab(BaseTab):
             except ValueError:
                 messagebox.showerror("錯誤", "腳本 Max Tokens 必須是正整數，或留空")
                 return
+        if values.get("AUTOCUT_MUSIC_VOLUME"):
+            try:
+                if float(values["AUTOCUT_MUSIC_VOLUME"]) < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("錯誤", "背景音樂音量必須是 0 或正數")
+                return
+        if values.get("AUTOCUT_MUSIC_DIR") and not Path(values["AUTOCUT_MUSIC_DIR"]).expanduser().is_dir():
+            messagebox.showerror("錯誤", "音樂資料夾不存在")
+            return
 
         try:
             write_env_values(values)
