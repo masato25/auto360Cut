@@ -61,7 +61,10 @@ class AutoTab(BaseTab):
         ttk.Button(btn_frame, text="設為必選", command=lambda: self._set_selected_weight(1)).pack(pady=(0, 4), fill=tk.X)
         ttk.Button(btn_frame, text="設為一般", command=lambda: self._set_selected_weight(0)).pack(pady=(0, 4), fill=tk.X)
         ttk.Button(btn_frame, text="移除選取", command=self._remove_selected).pack(pady=(0, 4), fill=tk.X)
-        ttk.Button(btn_frame, text="清空", command=self._clear_files).pack(fill=tk.X)
+        ttk.Button(btn_frame, text="清空", command=self._clear_files).pack(pady=(0, 6), fill=tk.X)
+        ttk.Separator(btn_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+        ttk.Button(btn_frame, text="匯出清單…", command=self._export_list).pack(pady=(4, 4), fill=tk.X)
+        ttk.Button(btn_frame, text="匯入清單…", command=self._import_list).pack(fill=tk.X)
 
         hint_row = ttk.Frame(vl)
         hint_row.pack(fill=tk.X, pady=(4, 0))
@@ -261,6 +264,74 @@ class AutoTab(BaseTab):
         self.auto_listbox.delete(0, tk.END)
         self.auto_weight_var.set("0")
         self.save_state()
+
+    def _export_list(self) -> None:
+        out = filedialog.asksaveasfilename(
+            title="匯出素材清單",
+            defaultextension=".json",
+            filetypes=[("JSON 清單", "*.json"), ("所有檔案", "*.*")],
+            initialfile="material_list.json",
+        )
+        if not out:
+            return
+        payload = {
+            "version": 1,
+            "files": [
+                {"path": f, "required": self.auto_weights.get(f, 0) > 0}
+                for f in self.auto_files
+            ],
+        }
+        try:
+            Path(out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.app.log(f"✓ 已匯出 {len(self.auto_files)} 筆素材清單 → {out}")
+        except Exception as exc:
+            messagebox.showerror("匯出失敗", f"無法寫入檔案：{exc}")
+
+    def _import_list(self) -> None:
+        infile = filedialog.askopenfilename(
+            title="匯入素材清單",
+            filetypes=[("JSON 清單", "*.json"), ("所有檔案", "*.*")],
+        )
+        if not infile:
+            return
+        try:
+            data = json.loads(Path(infile).read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("匯入失敗", f"無法讀取檔案：{exc}")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+            messagebox.showerror("匯入失敗", "檔案格式錯誤，找不到 files 陣列")
+            return
+
+        added = 0
+        missing = []
+        for entry in data["files"]:
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            path = path.strip()
+            if not Path(path).is_file():
+                missing.append(Path(path).name)
+                continue
+            required = 1 if entry.get("required", False) else 0
+            if path not in self.auto_files:
+                self.auto_files.append(path)
+                added += 1
+            self.auto_weights[path] = max(self.auto_weights.get(path, 0), required)
+
+        self._refresh_listbox()
+        self.save_state()
+
+        msg = f"匯入完成：新增 {added} 筆素材"
+        if missing:
+            msg += f"；{len(missing)} 個找不到（已略過）：{', '.join(missing[:5])}"
+            if len(missing) > 5:
+                msg += f" …及 {len(missing)-5} 個"
+        self.app.log(f"✓ {msg}")
+        if missing:
+            messagebox.showwarning("部分略過", msg)
 
     # ── required / normal flag ──────────────────────────────────────
 
