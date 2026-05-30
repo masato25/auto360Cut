@@ -242,10 +242,27 @@ _JSON_CONTRACT = (
 )
 
 
+def _build_weight_instruction(weight_files: dict[str, int] | None) -> str:
+    """Build a prompt instruction for mandatory source files."""
+    if not weight_files:
+        return ""
+    mandatory = sorted(fname for fname, w in weight_files.items() if w > 0)
+    if not mandatory:
+        return ""
+    lines = [
+        "\n**Mandatory source files:** The following source files MUST each contribute at least one clip to the final edit.",
+        "Treat all of them as equally required; do not rank them by preference or prominence.",
+    ]
+    for fname in mandatory:
+        lines.append(f"  - {fname}")
+    return "\n".join(lines)
+
+
 def _build_script_system_prompt(
     auto_prompt: bool,
     prompt: str,
     target_duration_minutes: float | None,
+    weight_files: dict[str, int] | None = None,
 ) -> str:
     duration_instruction = ""
     if target_duration_minutes and target_duration_minutes > 0:
@@ -254,6 +271,7 @@ def _build_script_system_prompt(
             "Highlight quality is more important than hitting the exact duration: when there are many strong clips, it is acceptable to be slightly longer; "
             "when there are not enough strong clips, return a shorter edit instead of adding mediocre filler."
         )
+    weight_instruction = _build_weight_instruction(weight_files)
 
     if auto_prompt:
         return (
@@ -261,6 +279,7 @@ def _build_script_system_prompt(
             "Analyze all available material yourself, infer the best theme and story arc, then choose clips for a tight highlight video with a clear beginning, development, turn, and ending.\n"
             f"{_HIGHLIGHT_INSTRUCTION}\n"
             f"{duration_instruction}\n"
+            f"{weight_instruction}\n"
             f"{_JSON_CONTRACT}"
         )
     return (
@@ -268,6 +287,7 @@ def _build_script_system_prompt(
         "Follow the user's request while still prioritizing a tight highlight edit with a clear beginning, development, turn, and ending.\n"
         f"{_HIGHLIGHT_INSTRUCTION}\n"
         f"{duration_instruction}\n"
+        f"{weight_instruction}\n"
         f"{_JSON_CONTRACT}"
         + ("\nAdditional user request: " + prompt if prompt else "")
     )
@@ -384,6 +404,7 @@ def ask_script(
     script_api_model: str | None = None,
     script_api_max_tokens: int | None = None,
     target_duration_minutes: float | None = None,
+    weight_files: dict[str, int] | None = None,
 ) -> list[dict]:
     default_api_base, default_api_key, default_model, default_max_tokens = _script_api_defaults()
     api_base = script_api_base or default_api_base
@@ -393,7 +414,7 @@ def ask_script(
         script_api_max_tokens if script_api_max_tokens is not None else default_max_tokens
     )
 
-    system = _build_script_system_prompt(auto_prompt, prompt, target_duration_minutes)
+    system = _build_script_system_prompt(auto_prompt, prompt, target_duration_minutes, weight_files=weight_files)
     user_msg = f"素材目錄：\n\n{catalog}"
     base_url = _normalize_openai_base_url(api_base)
 
@@ -456,6 +477,24 @@ def _source_key(filename: str) -> str:
     return base
 
 
+def _source_match_keys(filename: str) -> set[str]:
+    path = str(filename or "")
+    base = os.path.basename(path)
+    keys = {path, base, _source_key(path)}
+    try:
+        resolved = str(Path(path).expanduser().resolve())
+    except Exception:
+        resolved = path
+    keys.add(resolved)
+    keys.add(os.path.basename(resolved))
+    keys.add(_source_key(resolved))
+    return {k for k in keys if k}
+
+
+def _source_matches(left: str, right: str) -> bool:
+    return bool(_source_match_keys(left) & _source_match_keys(right))
+
+
 def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
     valid: list[dict] = []
     for item in script:
@@ -466,12 +505,7 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 
         best: dict | None = None
         for r in catalog_rows:
-            s_file_matches = (
-                r["source_file"] == src
-                or os.path.basename(r["source_file"]) == os.path.basename(src)
-                or os.path.basename(r["source_file"]) == src
-                or _source_key(r["source_file"]) == _source_key(src)
-            )
+            s_file_matches = _source_matches(r["source_file"], src)
             if not s_file_matches:
                 continue
             if abs(r["start_time"] - st) > 1.0:
@@ -491,6 +525,70 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
             click.echo(f"  ⚠ skipping invalid: {os.path.basename(src)} {_fmt_time(st)}-{_fmt_time(et)}", err=True)
 
     return valid
+
+
+def _ensure_weighted_files(
+    selected: list[dict],
+    rows: list[dict],
+    weight_files: dict[str, int] | None,
+) -> list[dict]:
+    """Ensure every mandatory source file contributes at least one clip.
+
+    If a mandatory file is missing from *selected*, automatically add its
+    best-scoring segment (longest / most descriptive caption) from *rows*.
+    """
+    if not weight_files:
+        return selected
+
+    mandatory = {fname for fname, w in weight_files.items() if w > 0}
+    mandatory_keys = {mf: _source_match_keys(mf) for mf in mandatory}
+    if not mandatory:
+        return selected
+
+    # Build lookup: which source files are already represented
+    represented: set[str] = set()
+    for s in selected:
+        src = s.get("source_file", "")
+        represented.update(_source_match_keys(src))
+
+    def _file_matches_weighted(src: str) -> str | None:
+        """Return the matching weight_files key if *src* matches a mandatory file."""
+        src_keys = _source_match_keys(src)
+        for mf, mf_keys in mandatory_keys.items():
+            if src_keys & mf_keys:
+                return mf
+        return None
+
+    missing = [mf for mf, mf_keys in mandatory_keys.items() if not (mf_keys & represented)]
+
+    if not missing:
+        return selected
+
+    # For each missing file, find the best chunk from rows
+    by_file: dict[str, list[dict]] = {}
+    for r in rows:
+        src = r.get("source_file", "")
+        mf = _file_matches_weighted(src)
+        if mf:
+            by_file.setdefault(mf, []).append(r)
+
+    for mf in missing:
+        candidates = sorted(
+            by_file.get(mf, []),
+            key=lambda c: (
+                c.get("end_time", 0) - c.get("start_time", 0),
+                len(c.get("caption", "") or ""),
+            ),
+            reverse=True,
+        )
+        if candidates:
+            best = dict(candidates[0])
+            best["narration"] = best.get("narration") or best.get("caption", "") or f"[mandatory: {os.path.basename(mf) or mf}]"
+            selected.append(best)
+            label = mf if os.path.basename(mf) == mf else f"{os.path.basename(mf)} ({mf})"
+            click.echo(f"  ℹ auto-added mandatory file: {label} ({_fmt_time(best['start_time'])}-{_fmt_time(best['end_time'])})", err=True)
+
+    return selected
 
 
 # ── 4. render ────────────────────────────────────────────────────────
@@ -1081,6 +1179,11 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Optional target final video duration in minutes for the script writer.")
 @click.option("--output-layout", type=click.Choice(OUTPUT_LAYOUT_CHOICES), default="landscape", show_default=True,
               help="Final video shape: landscape (橫式) or portrait (直式).")
+@click.option("--weight", "weight_args", multiple=True,
+              metavar="FILE[:FLAG]",
+              help="Mark a source file as mandatory (e.g. --weight 'vid.mp4' or --weight 'vid.mp4:1'). "
+                   "Mandatory files are guaranteed to appear in the final edit. "
+                   "May be repeated for multiple files.")
 @click.option("--opening-caption", default=None,
               help="Optional opening caption/title card text to insert before the first clip.")
 @click.option("--opening-caption-duration", default=None, type=float, hidden=True,
@@ -1112,6 +1215,7 @@ def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
            script_api_key, script_api_model, script_api_max_tokens,
            catalog_max_chars, target_duration_minutes, output_layout,
+           weight_args,
            opening_caption, opening_caption_duration,
            closing_caption, closing_caption_duration,
            opening_band, closing_band, band_box_color,
@@ -1120,6 +1224,28 @@ def create(videos, prompt, output, backend, model,
     backend = backend or _auto_backend()
     model = model or _auto_model()
     output_path = str(Path(output).expanduser().resolve())
+
+    # Parse --weight args as mandatory flags: "filename" or legacy "filename:weight"
+    weight_files: dict[str, int] | None = None
+    if weight_args:
+        weight_files = {}
+        for w_arg in weight_args:
+            if ":" in w_arg:
+                fname, w_str = w_arg.rsplit(":", 1)
+                try:
+                    w = int(w_str)
+                except ValueError:
+                    click.echo(f"  ⚠ invalid required flag in '{w_arg}'; skipping.", err=True)
+                    continue
+            else:
+                fname = w_arg
+                w = 1
+            fname = str(fname).strip()
+            if w > 0 and fname:
+                weight_files[fname] = 1
+        if weight_files:
+            readable_required = [os.path.basename(k) if os.path.basename(k) else k for k in weight_files]
+            click.echo(f"  Mandatory files: {readable_required}")
 
     click.echo(f"autoCut Script Mode — {len(videos)} video(s)")
     click.echo(f"Backend: {backend}  Output: {output_path}")
@@ -1159,11 +1285,14 @@ def create(videos, prompt, output, backend, model,
         script_api_model=script_api_model,
         script_api_max_tokens=script_api_max_tokens,
         target_duration_minutes=target_duration_minutes,
+        weight_files=weight_files,
     )
     click.echo(f"  AI suggested {len(script)} clip(s).")
 
     # 4. validate
     selected = validate_script(script, rows)
+    # Ensure mandatory files are represented
+    selected = _ensure_weighted_files(selected, rows, weight_files)
     click.echo(f"  {len(selected)} valid clip(s).")
     for s in selected:
         narration = s.get("narration", "")

@@ -20,6 +20,8 @@ class AutoTab(BaseTab):
 
     def __init__(self, parent, app):
         self.auto_files: list[str] = []
+        self.auto_weights: dict[str, int] = {}  # path → required flag (0 = normal, >0 = mandatory)
+        self.auto_weight_var = tk.StringVar(value="0")
         self.auto_output_layout = tk.StringVar(value="landscape")
         self.auto_target_duration = tk.StringVar(value="")
         self.auto_opening_caption = tk.StringVar(value="")
@@ -35,15 +37,40 @@ class AutoTab(BaseTab):
                   font=("", 11, "bold")).pack(anchor=tk.W)
         lrow = ttk.Frame(vl)
         lrow.pack(fill=tk.X, pady=(4, 0))
-        self.auto_listbox = tk.Listbox(lrow, height=4, font=("Menlo", 10))
-        self.auto_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.auto_listbox = tk.Listbox(
+            lrow,
+            height=6,
+            font=("Menlo", 10),
+            selectmode=tk.EXTENDED,
+            activestyle="dotbox",
+            exportselection=False,
+        )
+        self.auto_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.auto_listbox.bind("<Double-Button-1>", self._on_double_click)
+        self.auto_listbox.bind("<Return>", self._play_selected_event)
+        self.auto_listbox.bind("<Delete>", self._remove_selected_event)
+        self.auto_listbox.bind("plus", lambda _e: self._set_selected_weight(1))
+        self.auto_listbox.bind("minus", lambda _e: self._set_selected_weight(0))
+        self.auto_listbox.bind("<Left>", lambda _e: self._set_selected_weight(0))
+        self.auto_listbox.bind("<Right>", lambda _e: self._set_selected_weight(1))
         bind_listbox_double_click_to_play(self.auto_listbox, self.auto_files)
         btn_frame = ttk.Frame(lrow)
         btn_frame.pack(side=tk.RIGHT, padx=(6, 0), fill=tk.Y)
-        ttk.Button(btn_frame, text="新增影片…", command=self._add_files).pack(pady=(0, 4))
-        ttk.Button(btn_frame, text="播放選取", command=self._play_selected).pack(pady=(0, 4))
-        ttk.Button(btn_frame, text="移除選取", command=self._remove_selected).pack(pady=(0, 4))
-        ttk.Button(btn_frame, text="清空", command=self._clear_files).pack()
+        ttk.Button(btn_frame, text="新增影片…", command=self._add_files).pack(pady=(0, 4), fill=tk.X)
+        ttk.Button(btn_frame, text="播放選取", command=self._play_selected).pack(pady=(0, 4), fill=tk.X)
+        ttk.Button(btn_frame, text="設為必選", command=lambda: self._set_selected_weight(1)).pack(pady=(0, 4), fill=tk.X)
+        ttk.Button(btn_frame, text="設為一般", command=lambda: self._set_selected_weight(0)).pack(pady=(0, 4), fill=tk.X)
+        ttk.Button(btn_frame, text="移除選取", command=self._remove_selected).pack(pady=(0, 4), fill=tk.X)
+        ttk.Button(btn_frame, text="清空", command=self._clear_files).pack(fill=tk.X)
+
+        hint_row = ttk.Frame(vl)
+        hint_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(
+            hint_row,
+            text="快捷鍵：Enter 播放、Delete 移除、→ / + 設為必選、← / - 設為一般",
+            font=("", 9), foreground="gray",
+        ).pack(side=tk.LEFT)
+        self.auto_listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
 
         aopts = ttk.Frame(self)
         aopts.pack(fill=tk.X, pady=(0, 6))
@@ -76,7 +103,7 @@ class AutoTab(BaseTab):
 
         ttk.Label(
             self,
-            text="開場/閉場字幕留空＝不加；字幕秒數預設 3 秒，可用 .env 的 AUTOCUT_CAPTION_DURATION_SECONDS 調整；Band、音樂資料夾與音量可在「設定」頁籤調整；目標長度留空＝AI 自行決定片長。",
+            text="開場/閉場字幕留空＝不加；字幕秒數預設 3 秒，可用 .env 的 AUTOCUT_CAPTION_DURATION_SECONDS 調整；Band、音樂資料夾與音量可在「設定」頁籤調整；目標長度留空＝AI 自行決定片長。設為必選的素材一定會入選。",
             font=("", 9), foreground="gray", wraplength=520,
         ).pack(fill=tk.X, pady=(0, 6))
 
@@ -106,8 +133,22 @@ class AutoTab(BaseTab):
 
         auto_files = data.get("auto_files", [])
         if isinstance(auto_files, list):
-            self.auto_files = [str(f) for f in auto_files if isinstance(f, str)]
+            self.auto_files.clear()
+            self.auto_files.extend(str(f) for f in auto_files if isinstance(f, str))
             self._refresh_listbox()
+
+        auto_weights = data.get("auto_weights", {})
+        if isinstance(auto_weights, dict):
+            self.auto_weights = {
+                str(k): int(v) for k, v in auto_weights.items()
+                if isinstance(k, str) and isinstance(v, (int, float))
+            }
+        else:
+            self.auto_weights = {}
+        # Ensure every file has a weight entry
+        for f in self.auto_files:
+            if f not in self.auto_weights:
+                self.auto_weights[f] = 0
 
         auto_output = data.get("auto_output")
         if isinstance(auto_output, str):
@@ -134,15 +175,22 @@ class AutoTab(BaseTab):
             self.auto_music.set(auto_music)
 
     def save_state(self) -> None:
-        data = {
-            "auto_files": self.auto_files,
-            "auto_output": self.auto_output.get().strip(),
-            "auto_output_layout": self.auto_output_layout.get(),
-            "auto_target_duration": self.auto_target_duration.get().strip(),
-            "auto_opening_caption": self.auto_opening_caption.get().strip(),
-            "auto_closing_caption": self.auto_closing_caption.get().strip(),
-            "auto_music": self.auto_music.get(),
-        }
+        # Read existing state to preserve other tabs' data
+        try:
+            data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+        except (FileNotFoundError, Exception):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        data["auto_files"] = self.auto_files
+        data["auto_weights"] = self.auto_weights
+        data["auto_output"] = self.auto_output.get().strip()
+        data["auto_output_layout"] = self.auto_output_layout.get()
+        data["auto_target_duration"] = self.auto_target_duration.get().strip()
+        data["auto_opening_caption"] = self.auto_opening_caption.get().strip()
+        data["auto_closing_caption"] = self.auto_closing_caption.get().strip()
+        data["auto_music"] = self.auto_music.get()
         try:
             _STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
@@ -153,7 +201,9 @@ class AutoTab(BaseTab):
     def _refresh_listbox(self) -> None:
         self.auto_listbox.delete(0, tk.END)
         for f in self.auto_files:
-            self.auto_listbox.insert(tk.END, Path(f).name)
+            w = self.auto_weights.get(f, 0)
+            label = f"⚡{Path(f).name}" if w > 0 else Path(f).name
+            self.auto_listbox.insert(tk.END, label)
 
     def _add_files(self) -> None:
         files = filedialog.askopenfilenames(
@@ -164,8 +214,10 @@ class AutoTab(BaseTab):
         for f in files:
             if f not in self.auto_files:
                 self.auto_files.append(f)
-                self.auto_listbox.insert(tk.END, Path(f).name)
+                self.auto_weights[f] = 0
                 changed = True
+        if changed:
+            self._refresh_listbox()
         if len(self.auto_files) == 1:
             stem = Path(self.auto_files[0]).stem
             self.auto_output.set(str(Path.home() / "Movies" / f"{stem}_auto.mp4"))
@@ -175,18 +227,80 @@ class AutoTab(BaseTab):
     def _play_selected(self) -> None:
         play_selected_listbox_video(self.auto_listbox, self.auto_files)
 
+    def _play_selected_event(self, event: object = None) -> str:
+        self._play_selected()
+        return "break"
+
+    def _on_double_click(self, event: object = None) -> None:
+        play_selected_listbox_video(self.auto_listbox, self.auto_files)
+
+    def _remove_selected_event(self, event: object = None) -> str:
+        self._remove_selected()
+        return "break"
+
     def _remove_selected(self) -> None:
-        sel = self.auto_listbox.curselection()
-        if not sel:
+        selected = list(self.auto_listbox.curselection())
+        if not selected:
             return
-        idx = sel[0]
-        self.auto_listbox.delete(idx)
-        del self.auto_files[idx]
+        for idx in reversed(selected):
+            if 0 <= idx < len(self.auto_files):
+                path = self.auto_files[idx]
+                self.auto_files.pop(idx)
+                self.auto_weights.pop(path, None)
+        self._refresh_listbox()
+        if self.auto_files:
+            next_idx = min(selected[0], len(self.auto_files) - 1)
+            self.auto_listbox.selection_set(next_idx)
+            self.auto_listbox.activate(next_idx)
+        self._on_listbox_select()
         self.save_state()
 
     def _clear_files(self) -> None:
         self.auto_files.clear()
+        self.auto_weights.clear()
         self.auto_listbox.delete(0, tk.END)
+        self.auto_weight_var.set("0")
+        self.save_state()
+
+    # ── required / normal flag ──────────────────────────────────────
+
+    def _on_listbox_select(self, event: object = None) -> None:
+        sel = self.auto_listbox.curselection()
+        if not sel:
+            self.auto_weight_var.set("0")
+            return
+
+        weights = {
+            1 if self.auto_weights.get(self.auto_files[idx], 0) > 0 else 0
+            for idx in sel
+            if 0 <= idx < len(self.auto_files)
+        }
+        if len(weights) == 1:
+            self.auto_weight_var.set(str(next(iter(weights))))
+        else:
+            self.auto_weight_var.set("")
+
+    def _restore_selection(self, selected: list[int]) -> None:
+        for idx in selected:
+            if 0 <= idx < len(self.auto_files):
+                self.auto_listbox.selection_set(idx)
+        if selected:
+            anchor = min(selected[0], len(self.auto_files) - 1)
+            if anchor >= 0:
+                self.auto_listbox.activate(anchor)
+                self.auto_listbox.see(anchor)
+
+    def _set_selected_weight(self, weight: int) -> None:
+        selected = list(self.auto_listbox.curselection())
+        if not selected:
+            return
+        normalized = 1 if int(weight) > 0 else 0
+        for idx in selected:
+            if 0 <= idx < len(self.auto_files):
+                self.auto_weights[self.auto_files[idx]] = normalized
+        self.auto_weight_var.set(str(normalized))
+        self._refresh_listbox()
+        self._restore_selection(selected)
         self.save_state()
 
     def _browse_output(self) -> None:
@@ -242,6 +356,10 @@ class AutoTab(BaseTab):
             args.extend(["--closing-caption", closing_caption])
         if self.auto_music.get():
             args.append("--auto-music")
+        # Weight args
+        for path, w in self.auto_weights.items():
+            if w > 0:
+                args.extend(["--weight", f"{path}:{w}"])
         verbose_enabled = is_verbose_enabled()
         if verbose_enabled:
             args.append("--verbose")
@@ -249,7 +367,9 @@ class AutoTab(BaseTab):
         self.app.clear_log()
         self.app.log(f"▶ 一鍵腳本剪輯: {len(self.auto_files)} 部素材")
         for sf in self.auto_files:
-            self.app.log(f"    {Path(sf).name}")
+            required = self.auto_weights.get(sf, 0) > 0
+            tag = " [必選]" if required else ""
+            self.app.log(f"    {Path(sf).name}{tag}")
         self.app.log("  Backend: from .env AUTOCUT_BACKEND")
         self.app.log(f"  Layout: {self.auto_output_layout.get()}")
         self.app.log(f"  Target duration: {target_duration or 'auto'} min")

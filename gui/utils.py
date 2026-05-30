@@ -21,7 +21,12 @@ def play_selected_listbox_video(listbox: tk.Listbox, files: list[str]) -> None:
         messagebox.showwarning("提示", "請先選取要播放的素材影片")
         return
 
-    path = files[sel[0]]
+    idx = sel[0]
+    if idx < 0 or idx >= len(files):
+        messagebox.showerror("錯誤", "清單資料不同步，請切換頁籤後重試")
+        return
+
+    path = files[idx]
     if not os.path.isfile(path):
         messagebox.showerror("錯誤", f"找不到影片檔案：\n{path}")
         return
