@@ -53,8 +53,17 @@ def _auto_backend() -> str:
     return os.environ.get("AUTOCUT_BACKEND", "local-api")
 
 
-def _auto_model() -> str | None:
-    return os.environ.get("LOCAL_API_MODEL") or None
+def _auto_model(backend: str | None = None) -> str | None:
+    """Return a model override only for backends that accept --model.
+
+    Cloud backends such as Gemini manage their own model configuration; passing
+    LOCAL_API_MODEL through to them makes validation fail when users keep both
+    local-api and Gemini examples in the same .env file.
+    """
+    backend = backend or _auto_backend()
+    if backend in {"local", "local-api"}:
+        return os.environ.get("LOCAL_API_MODEL") or None
+    return None
 
 
 # ── 1. index ─────────────────────────────────────────────────────────
@@ -1146,7 +1155,7 @@ def cli():
 def index_command(videos, backend, model, force_reindex, verbose):
     """Index videos only, without creating or rendering an edit."""
     backend = backend or _auto_backend()
-    model = model or _auto_model()
+    model = model or _auto_model(backend)
 
     click.echo(f"autoCut Index — {len(videos)} video(s)")
     click.echo(f"Backend: {backend}")
@@ -1232,7 +1241,7 @@ def create(videos, prompt, output, backend, model,
            enhance, enhance_plan, auto_music, music_dir, music_volume, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
-    model = model or _auto_model()
+    model = model or _auto_model(backend)
     output_path = str(Path(output).expanduser().resolve())
 
     # Parse --weight args as mandatory flags: "filename" or legacy "filename:weight"

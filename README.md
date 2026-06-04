@@ -113,6 +113,63 @@ cp .env.example .env
 .venv/bin/python autocut.py autocut --help
 ```
 
+## AI 後端設定：支援兩種 VLM + LLM 組合
+
+auto360Cut 把「看影片 / 建索引 / 搜尋」與「腳本生成」分開設定：
+
+- **VLM backend**：`AUTOCUT_BACKEND`，用在 `autocut.py autocut` 與 `autocut_script.py index/create` 的影片理解、caption、embedding。
+- **Script LLM**：`AUTOCUT_SCRIPT_API_*`，只用在 `autocut_script.py create` 產生剪輯腳本。
+
+因此目前建議使用以下兩種模式：
+
+### 方式 1：llama.cpp/local-api 本地 VLM + 你自架的 OpenAI-compatible LLM
+
+適合想讓影片分析與腳本生成都留在本機 / 區網的情境。先啟動 OpenAI-compatible VLM/embedding server（例如 llama.cpp），並準備你自架的 OpenAI-compatible chat LLM，再設定：
+
+```env
+AUTOCUT_BACKEND=local-api
+LOCAL_API_BASE=http://0.0.0.0:8080
+LOCAL_API_MODEL=ggml-org_Qwen2.5-VL-7B-Instruct-GGUF_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf
+#LOCAL_API_EMBEDDINGS_MODEL=your-embedding-model
+
+AUTOCUT_SCRIPT_API_BASE=http://0.0.0.0:8080/v1
+AUTOCUT_SCRIPT_API_KEY=not-needed
+AUTOCUT_SCRIPT_API_MODEL=your-openai-compatible-llm
+```
+
+使用：
+
+```bash
+./.venv/bin/python autocut_script.py create ./chain_trip/LRV_20260415_155421_01_001.lrv \
+  --auto-prompt \
+  -o ./script_output.mp4
+```
+
+### 方式 2：Gemini VLM + DeepSeek LLM
+
+適合不想架本地 VLM、直接用 Gemini 做影片 embedding/search，再讓 DeepSeek 寫腳本：
+
+```env
+AUTOCUT_BACKEND=gemini
+GEMINI_API_KEY=your-gemini-api-key
+
+AUTOCUT_SCRIPT_API_BASE=https://api.deepseek.com/v1
+AUTOCUT_SCRIPT_API_KEY=your-deepseek-api-key
+AUTOCUT_SCRIPT_API_MODEL=deepseek-chat
+```
+
+使用：
+
+```bash
+./.venv/bin/python autocut_script.py create ./chain_trip/LRV_20260415_155421_01_001.lrv \
+  --backend gemini \
+  --auto-prompt \
+  -o ./script_output.mp4
+```
+
+> 注意：`autocut.py autocut` 不會呼叫 Script LLM；`AUTOCUT_SCRIPT_API_*` 指定的 LLM 只會在 `autocut_script.py create` 的腳本生成階段使用。方式 1 可填你自架的 OpenAI-compatible 端點，方式 2 則填 DeepSeek。
+
+
 ### macOS Python 3.14 疑難排解（expat）
 
 Homebrew 的 Python 3.14 依賴新版 `libexpat`，但 macOS 系統內建的是舊版，會導致 `pip install` 失敗：
