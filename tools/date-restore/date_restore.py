@@ -8,11 +8,10 @@ For all files: tries filename pattern matching (Insta360: VID_YYYYMMDD_HHMMSS*)
 Fallback: uses file birth time (macOS st_birthtime) or modification time
 
 Usage:
-    python scripts/add_date_to_name.py <file_or_directory> [--dry-run] [--recursive] [--force]
+    python tools/date-restore/date_restore.py <file_or_directory> [--dry-run] [--recursive] [--force]
 """
 
 import os
-import sys
 import json
 import struct
 import subprocess

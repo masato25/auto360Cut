@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from enhancement import (  # noqa: E402
     apply_audio_normalize,
     apply_enhancement,
     build_enhance_plan,
+    ffmpeg_video_encode_args,
     get_enhance_settings,
     write_enhance_plan,
 )
@@ -242,10 +244,27 @@ _JSON_CONTRACT = (
 )
 
 
+def _build_weight_instruction(weight_files: dict[str, int] | None) -> str:
+    """Build a prompt instruction for mandatory source files."""
+    if not weight_files:
+        return ""
+    mandatory = sorted(fname for fname, w in weight_files.items() if w > 0)
+    if not mandatory:
+        return ""
+    lines = [
+        "\n**Mandatory source files:** The following source files MUST each contribute at least one clip to the final edit.",
+        "Treat all of them as equally required; do not rank them by preference or prominence.",
+    ]
+    for fname in mandatory:
+        lines.append(f"  - {fname}")
+    return "\n".join(lines)
+
+
 def _build_script_system_prompt(
     auto_prompt: bool,
     prompt: str,
     target_duration_minutes: float | None,
+    weight_files: dict[str, int] | None = None,
 ) -> str:
     duration_instruction = ""
     if target_duration_minutes and target_duration_minutes > 0:
@@ -254,6 +273,7 @@ def _build_script_system_prompt(
             "Highlight quality is more important than hitting the exact duration: when there are many strong clips, it is acceptable to be slightly longer; "
             "when there are not enough strong clips, return a shorter edit instead of adding mediocre filler."
         )
+    weight_instruction = _build_weight_instruction(weight_files)
 
     if auto_prompt:
         return (
@@ -261,6 +281,7 @@ def _build_script_system_prompt(
             "Analyze all available material yourself, infer the best theme and story arc, then choose clips for a tight highlight video with a clear beginning, development, turn, and ending.\n"
             f"{_HIGHLIGHT_INSTRUCTION}\n"
             f"{duration_instruction}\n"
+            f"{weight_instruction}\n"
             f"{_JSON_CONTRACT}"
         )
     return (
@@ -268,6 +289,7 @@ def _build_script_system_prompt(
         "Follow the user's request while still prioritizing a tight highlight edit with a clear beginning, development, turn, and ending.\n"
         f"{_HIGHLIGHT_INSTRUCTION}\n"
         f"{duration_instruction}\n"
+        f"{weight_instruction}\n"
         f"{_JSON_CONTRACT}"
         + ("\nAdditional user request: " + prompt if prompt else "")
     )
@@ -384,6 +406,7 @@ def ask_script(
     script_api_model: str | None = None,
     script_api_max_tokens: int | None = None,
     target_duration_minutes: float | None = None,
+    weight_files: dict[str, int] | None = None,
 ) -> list[dict]:
     default_api_base, default_api_key, default_model, default_max_tokens = _script_api_defaults()
     api_base = script_api_base or default_api_base
@@ -393,7 +416,7 @@ def ask_script(
         script_api_max_tokens if script_api_max_tokens is not None else default_max_tokens
     )
 
-    system = _build_script_system_prompt(auto_prompt, prompt, target_duration_minutes)
+    system = _build_script_system_prompt(auto_prompt, prompt, target_duration_minutes, weight_files=weight_files)
     user_msg = f"素材目錄：\n\n{catalog}"
     base_url = _normalize_openai_base_url(api_base)
 
@@ -456,6 +479,24 @@ def _source_key(filename: str) -> str:
     return base
 
 
+def _source_match_keys(filename: str) -> set[str]:
+    path = str(filename or "")
+    base = os.path.basename(path)
+    keys = {path, base, _source_key(path)}
+    try:
+        resolved = str(Path(path).expanduser().resolve())
+    except Exception:
+        resolved = path
+    keys.add(resolved)
+    keys.add(os.path.basename(resolved))
+    keys.add(_source_key(resolved))
+    return {k for k in keys if k}
+
+
+def _source_matches(left: str, right: str) -> bool:
+    return bool(_source_match_keys(left) & _source_match_keys(right))
+
+
 def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
     valid: list[dict] = []
     for item in script:
@@ -466,12 +507,7 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
 
         best: dict | None = None
         for r in catalog_rows:
-            s_file_matches = (
-                r["source_file"] == src
-                or os.path.basename(r["source_file"]) == os.path.basename(src)
-                or os.path.basename(r["source_file"]) == src
-                or _source_key(r["source_file"]) == _source_key(src)
-            )
+            s_file_matches = _source_matches(r["source_file"], src)
             if not s_file_matches:
                 continue
             if abs(r["start_time"] - st) > 1.0:
@@ -493,8 +529,82 @@ def validate_script(script: list[dict], catalog_rows: list[dict]) -> list[dict]:
     return valid
 
 
+def _ensure_weighted_files(
+    selected: list[dict],
+    rows: list[dict],
+    weight_files: dict[str, int] | None,
+) -> list[dict]:
+    """Ensure every mandatory source file contributes at least one clip.
+
+    If a mandatory file is missing from *selected*, automatically add its
+    best-scoring segment (longest / most descriptive caption) from *rows*.
+    """
+    if not weight_files:
+        return selected
+
+    mandatory = {fname for fname, w in weight_files.items() if w > 0}
+    mandatory_keys = {mf: _source_match_keys(mf) for mf in mandatory}
+    if not mandatory:
+        return selected
+
+    # Build lookup: which source files are already represented
+    represented: set[str] = set()
+    for s in selected:
+        src = s.get("source_file", "")
+        represented.update(_source_match_keys(src))
+
+    def _file_matches_weighted(src: str) -> str | None:
+        """Return the matching weight_files key if *src* matches a mandatory file."""
+        src_keys = _source_match_keys(src)
+        for mf, mf_keys in mandatory_keys.items():
+            if src_keys & mf_keys:
+                return mf
+        return None
+
+    missing = [mf for mf, mf_keys in mandatory_keys.items() if not (mf_keys & represented)]
+
+    if not missing:
+        return selected
+
+    # For each missing file, find the best chunk from rows
+    by_file: dict[str, list[dict]] = {}
+    for r in rows:
+        src = r.get("source_file", "")
+        mf = _file_matches_weighted(src)
+        if mf:
+            by_file.setdefault(mf, []).append(r)
+
+    for mf in missing:
+        candidates = sorted(
+            by_file.get(mf, []),
+            key=lambda c: (
+                c.get("end_time", 0) - c.get("start_time", 0),
+                len(c.get("caption", "") or ""),
+            ),
+            reverse=True,
+        )
+        if candidates:
+            best = dict(candidates[0])
+            best["narration"] = best.get("narration") or best.get("caption", "") or f"[mandatory: {os.path.basename(mf) or mf}]"
+            selected.append(best)
+            label = mf if os.path.basename(mf) == mf else f"{os.path.basename(mf)} ({mf})"
+            click.echo(f"  ℹ auto-added mandatory file: {label} ({_fmt_time(best['start_time'])}-{_fmt_time(best['end_time'])})", err=True)
+
+    return selected
+
+
 # ── 4. render ────────────────────────────────────────────────────────
 OUTPUT_LAYOUT_CHOICES = ("landscape", "portrait")
+CAPTION_DURATION_ENV = "AUTOCUT_CAPTION_DURATION_SECONDS"
+BAND_TEXT_ENV = "AUTOCUT_BAND_TEXT"
+BAND_BOX_COLOR_ENV = "AUTOCUT_BAND_BOX_COLOR"
+DEFAULT_CAPTION_DURATION = 3.0
+DEFAULT_BAND_BOX_COLOR = "black@1.0"
+MUSIC_DIR_ENV = "AUTOCUT_MUSIC_DIR"
+DEFAULT_MUSIC_VOLUME = 0.18
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".aiff", ".aif"}
+# Backward-compatible name for older callers/tests.
+DEFAULT_OPENING_CAPTION_DURATION = DEFAULT_CAPTION_DURATION
 
 
 def _render_layout_filter(layout: str) -> tuple[str, int | None, int | None]:
@@ -524,6 +634,259 @@ def _choose_output_layout(requested_layout: str) -> str:
     return requested_layout
 
 
+def _escape_drawtext_text(text: str) -> str:
+    """Escape user text for ffmpeg drawtext's text= value."""
+    return (
+        text.replace("\\", r"\\")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+        .replace("%", r"\%")
+        .replace("\n", r"\n")
+        .replace("\r", "")
+    )
+
+
+def _opening_caption_dimensions(layout: str) -> tuple[int, int]:
+    _, width, height = _render_layout_filter(layout)
+    if width is None or height is None:
+        raise ValueError(f"unknown output layout: {layout}")
+    return width, height
+
+
+def _normalize_caption_duration(duration: float | int | str | None = None) -> float:
+    """Return the title/closing-card duration.
+
+    One shared duration is used for both opening and closing captions.  It
+    defaults to 3 seconds and can be changed with AUTOCUT_CAPTION_DURATION_SECONDS.
+    """
+    raw = duration
+    if raw is None:
+        raw = os.environ.get(CAPTION_DURATION_ENV, "").strip() or DEFAULT_CAPTION_DURATION
+    try:
+        normalized = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{CAPTION_DURATION_ENV} must be a positive number") from exc
+    if normalized <= 0:
+        raise ValueError(f"{CAPTION_DURATION_ENV} must be positive")
+    return normalized
+
+
+def _normalize_opening_caption_duration(duration: float | int | str | None = None) -> float:
+    """Backward-compatible wrapper for older callers/tests.
+
+    Historically this helper ignored environment configuration and returned the
+    built-in default when called with ``None``.  Keep that contract while render
+    paths use ``_normalize_caption_duration`` for the shared env-aware setting.
+    """
+    return _normalize_caption_duration(DEFAULT_CAPTION_DURATION if duration is None else duration)
+
+
+_CJK_FONT_CANDIDATES = (
+    # macOS
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    # Linux
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    # Windows
+    r"C:\\Windows\\Fonts\\msjh.ttc",
+    r"C:\\Windows\\Fonts\\mingliu.ttc",
+    r"C:\\Windows\\Fonts\\simhei.ttf",
+)
+
+
+def _opening_caption_fontfile() -> str | None:
+    """Return a UTF-8/CJK-capable font file for ffmpeg drawtext, if available."""
+    configured = os.environ.get("AUTOCUT_OPENING_CAPTION_FONT", "").strip()
+    if configured:
+        return configured
+    for candidate in _CJK_FONT_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _escape_drawtext_option_value(value: str) -> str:
+    """Escape a generic ffmpeg drawtext option value such as fontfile."""
+    return value.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+
+
+def _caption_drawtext_filter(text: str, *, layout: str, position: str = "center", box_color: str | None = None) -> str:
+    caption = (text or "").strip()
+    if not caption:
+        raise ValueError("caption text is empty")
+    if position not in {"center", "bottom-right"}:
+        raise ValueError(f"unknown caption position: {position}")
+    font_size = 56 if layout == "portrait" else 42
+    border_width = 24
+    if position == "bottom-right":
+        # Smaller channel/name band in the lower-right corner.
+        font_size = 42 if layout == "portrait" else 30
+        border_width = 16
+        x_expr = "w-text_w-48"
+        y_expr = "h-text_h-48"
+    else:
+        x_expr = "(w-text_w)/2"
+        y_expr = "(h-text_h)/2"
+    escaped_text = _escape_drawtext_text(caption)
+    fontfile = _opening_caption_fontfile()
+    font_option = ""
+    if fontfile:
+        font_option = f"fontfile='{_escape_drawtext_option_value(fontfile)}':"
+    box_color = (box_color or DEFAULT_BAND_BOX_COLOR).strip() or DEFAULT_BAND_BOX_COLOR
+    return (
+        "format=yuv420p,"
+        "drawtext="
+        f"{font_option}"
+        f"text='{escaped_text}':"
+        "fontcolor=white:"
+        f"fontsize={font_size}:"
+        "line_spacing=14:"
+        f"x={x_expr}:"
+        f"y={y_expr}:"
+        f"box=1:boxcolor={_escape_drawtext_option_value(box_color)}:boxborderw={border_width}:"
+        f"fix_bounds=1"
+    )
+
+
+def _opening_caption_drawtext_filter(text: str, *, layout: str) -> str:
+    return _caption_drawtext_filter(text, layout=layout, position="center", box_color="black@1.0")
+
+
+def _band_caption_drawtext_filter(text: str, *, layout: str, box_color: str | None = None) -> str:
+    return _caption_drawtext_filter(text, layout=layout, position="bottom-right", box_color=box_color)
+
+
+def _render_opening_caption_clip(
+    ffmpeg: str,
+    *,
+    text: str,
+    output_path: str,
+    layout: str,
+    duration: float | int | None = None,
+    band_text: str | None = None,
+    band_box_color: str | None = None,
+) -> str:
+    """Create a short white title/closing card matching the script-mode output format."""
+    caption = (text or "").strip()
+    if not caption:
+        raise ValueError("opening caption text is empty")
+    duration = _normalize_opening_caption_duration(duration)
+    width, height = _opening_caption_dimensions(layout)
+    filters = [_opening_caption_drawtext_filter(caption, layout=layout)]
+    band = (band_text or "").strip()
+    if band:
+        filters.append(_band_caption_drawtext_filter(band, layout=layout, box_color=band_box_color))
+    vf = ",".join(filters)
+    result = subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-f", "lavfi", "-i", f"color=c=white:s={width}x{height}:r=30:d={duration:g}",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-t", f"{duration:g}",
+            "-vf", vf,
+            *ffmpeg_video_encode_args(ffmpeg, preset_speed="fast", crf="18"),
+            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        raise RuntimeError(result.stderr.strip() or "ffmpeg opening caption render failed")
+    return output_path
+
+
+def _music_candidates(music_dir: str | None = None) -> list[str]:
+    """Return supported audio files from the configured music directory."""
+    directory = (music_dir or os.environ.get(MUSIC_DIR_ENV, "")).strip()
+    if not directory:
+        return []
+    root = Path(directory).expanduser()
+    if not root.is_dir():
+        return []
+    files = [
+        str(path.resolve())
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+    ]
+    return sorted(files, key=lambda p: p.lower())
+
+
+def _select_music_file(
+    *,
+    selected: list[dict],
+    output_path: str,
+    music_dir: str | None = None,
+) -> str | None:
+    """Pick a deterministic music file for this edit.
+
+    The selection is automatic but stable: the same clip list/output name maps to
+    the same track, while different edits tend to rotate through the library.
+    """
+    candidates = _music_candidates(music_dir)
+    if not candidates:
+        return None
+    seed_parts = [os.path.basename(output_path)]
+    for clip in selected:
+        seed_parts.append(str(clip.get("source_file", "")))
+        seed_parts.append(str(clip.get("start_time", "")))
+        seed_parts.append(str(clip.get("end_time", "")))
+    digest = hashlib.sha256("|".join(seed_parts).encode("utf-8")).hexdigest()
+    return candidates[int(digest[:12], 16) % len(candidates)]
+
+
+def _normalize_music_volume(volume: float | int | str | None) -> float:
+    raw = volume
+    if raw is None:
+        raw = os.environ.get("AUTOCUT_MUSIC_VOLUME", "").strip() or DEFAULT_MUSIC_VOLUME
+    try:
+        normalized = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AUTOCUT_MUSIC_VOLUME must be a non-negative number") from exc
+    if normalized < 0:
+        raise ValueError("AUTOCUT_MUSIC_VOLUME must be non-negative")
+    return normalized
+
+
+def _apply_background_music(
+    ffmpeg: str,
+    input_path: str,
+    output_path: str,
+    music_path: str,
+    *,
+    volume: float | int | str | None = None,
+) -> str:
+    """Mix selected music under the existing video audio, looping to output duration."""
+    music_volume = _normalize_music_volume(volume)
+    result = subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-i", input_path,
+            "-stream_loop", "-1", "-i", music_path,
+            "-filter_complex",
+            f"[1:a]volume={music_volume:g}[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]",
+            "-map", "0:v:0", "-map", "[a]",
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
+            "-shortest", "-movflags", "+faststart",
+            output_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        raise RuntimeError(result.stderr.strip() or "ffmpeg background music mix failed")
+    return output_path
+
+
 def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *, layout: str) -> str:
     """Re-encode a clip to one stable format before concat.
 
@@ -541,8 +904,8 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *
             ffmpeg, "-y", "-i", input_path,
             "-vf", vf,
             *scale_args,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+            *ffmpeg_video_encode_args(ffmpeg, preset_speed="medium", crf="18"),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
             output_path,
         ],
@@ -556,8 +919,17 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *
 
 def render(selected: list[dict], *, output_path: str,
            hq_dir: str | None, output_layout: str,
-           enhance: str = "none", enhance_plan_path: str | None = None) -> None:
-    from autocut import convert_clip_to_flat, detect_360_projection
+           enhance: str = "none", enhance_plan_path: str | None = None,
+           opening_caption: str | None = None,
+           opening_caption_duration: float | int | None = None,
+           closing_caption: str | None = None,
+           closing_caption_duration: float | int | None = None,
+           opening_band: str | None = None,
+           closing_band: str | None = None,
+           band_box_color: str | None = None,
+           auto_music: bool = False,
+           music_dir: str | None = None,
+           music_volume: float | int | str | None = None) -> None:
     from sentrysearch.trimmer import trim_clip
 
     ffmpeg = _get_ffmpeg()
@@ -574,13 +946,72 @@ def render(selected: list[dict], *, output_path: str,
     enhance_settings = get_enhance_settings(enhance)
     if enhance_settings.preset != "none":
         click.echo(f"  Enhance preset: {enhance_settings.preset} — {enhance_settings.description}")
+    opening_caption_text = (opening_caption or "").strip()
+    closing_caption_text = (closing_caption or "").strip()
+    env_band_text = os.environ.get(BAND_TEXT_ENV, "").strip()
+    # AUTOCUT_BAND_TEXT is the current single source for the lower-right band:
+    # once set, both opening and closing caption cards use the same band text.
+    # Legacy CLI/API arguments still work only when the shared env setting is empty.
+    opening_band_text = env_band_text or (opening_band or "").strip()
+    closing_band_text = env_band_text or (closing_band or "").strip()
+    resolved_band_box_color = (band_box_color or os.environ.get(BAND_BOX_COLOR_ENV, "").strip() or DEFAULT_BAND_BOX_COLOR)
+    caption_duration: float | None = None
+    if opening_caption_text or closing_caption_text:
+        # One shared setting for both opening and closing captions.  GUI/CLI do
+        # not expose per-caption duration; set AUTOCUT_CAPTION_DURATION_SECONDS
+        # in .env to change it from the default 3 seconds.
+        explicit_duration = opening_caption_duration if opening_caption_duration is not None else closing_caption_duration
+        caption_duration = _normalize_caption_duration(explicit_duration)
+    if opening_caption_text:
+        opening_caption_duration = caption_duration
+        click.echo(f"  Opening caption: {opening_caption_text} ({opening_caption_duration:g}s)")
+    if closing_caption_text:
+        closing_caption_duration = caption_duration
+        click.echo(f"  Closing caption: {closing_caption_text} ({closing_caption_duration:g}s)")
+    if opening_band_text or closing_band_text:
+        click.echo(f"  Band box color: {resolved_band_box_color}")
+        if opening_band_text:
+            click.echo(f"  Opening band: {opening_band_text}")
+        if closing_band_text:
+            click.echo(f"  Closing band: {closing_band_text}")
+    selected_music: str | None = None
+    if auto_music:
+        selected_music = _select_music_file(
+            selected=selected,
+            output_path=output_path,
+            music_dir=music_dir,
+        )
+        if selected_music:
+            click.echo(f"  Auto music: {os.path.basename(selected_music)}")
+        else:
+            directory = (music_dir or os.environ.get(MUSIC_DIR_ENV, "")).strip()
+            if directory:
+                click.echo(f"  ⚠ Auto music enabled but no supported audio files found in: {directory}", err=True)
+            else:
+                click.echo(f"  ⚠ Auto music enabled but {MUSIC_DIR_ENV} is not set.", err=True)
 
     try:
+        if opening_caption_text:
+            title_path = output_path.replace(".mp4", "_opening_caption.mp4")
+            click.echo("  Rendering opening caption...")
+            _render_opening_caption_clip(
+                ffmpeg,
+                text=opening_caption_text,
+                output_path=title_path,
+                layout=resolved_layout,
+                duration=opening_caption_duration,
+                band_text=opening_band_text,
+                band_box_color=resolved_band_box_color,
+            )
+            clip_files.append(title_path)
+
         for i, s in enumerate(selected):
             clip_path = output_path.replace(".mp4", f"_{i}.mp4")
             trim_source = _resolve_hq_source(s["source_file"], hq_dir=hq_dir) or s["source_file"]
 
             if s.get("is_360"):
+                from autocut import convert_clip_to_flat, detect_360_projection
+
                 yaw = s.get("best_yaw", 0)
                 direction = s.get("best_direction", "front")
                 intermediate = clip_path.replace(".mp4", "_raw.mp4")
@@ -610,6 +1041,20 @@ def render(selected: list[dict], *, output_path: str,
             temp_files.append(clip_path)
             clip_files.append(normalized_path)
 
+        if closing_caption_text:
+            closing_path = output_path.replace(".mp4", "_closing_caption.mp4")
+            click.echo("  Rendering closing caption...")
+            _render_opening_caption_clip(
+                ffmpeg,
+                text=closing_caption_text,
+                output_path=closing_path,
+                layout=resolved_layout,
+                duration=closing_caption_duration,
+                band_text=closing_band_text,
+                band_box_color=resolved_band_box_color,
+            )
+            clip_files.append(closing_path)
+
         if not clip_files:
             raise RuntimeError("No clips were successfully trimmed.")
 
@@ -617,7 +1062,7 @@ def render(selected: list[dict], *, output_path: str,
             for cf in clip_files:
                 f.write(f"file '{os.path.abspath(cf)}'\n")
 
-        # Clips were already normalized to identical H.264/AAC parameters, so
+        # Clips were already normalized to identical video/AAC parameters, so
         # stream-copy concat is safe and avoids a second generation loss.
         result = subprocess.run(
             [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
@@ -627,13 +1072,39 @@ def render(selected: list[dict], *, output_path: str,
         if result.returncode != 0 or not os.path.isfile(output_path):
             raise RuntimeError(result.stderr.strip() or "ffmpeg concat failed")
 
+        if selected_music:
+            music_output_path = output_path.replace(".mp4", "_music.mp4")
+            temp_files.append(music_output_path)
+            click.echo("  Mixing background music...")
+            _apply_background_music(
+                ffmpeg,
+                output_path,
+                music_output_path,
+                selected_music,
+                volume=music_volume,
+            )
+            os.replace(music_output_path, output_path)
+
         if enhance_settings.preset != "none":
             plan = build_enhance_plan(
                 preset=enhance_settings.preset,
                 input_path=output_path,
                 output_path=output_path,
                 context="script",
-                extra={"clip_count": len(selected), "output_layout": resolved_layout},
+                extra={
+                    "clip_count": len(selected),
+                    "output_layout": resolved_layout,
+                    "opening_caption": opening_caption_text,
+                    "opening_caption_duration": opening_caption_duration if opening_caption_text else None,
+                    "closing_caption": closing_caption_text,
+                    "closing_caption_duration": closing_caption_duration if closing_caption_text else None,
+                    "opening_band": opening_band_text,
+                    "closing_band": closing_band_text,
+                    "band_box_color": resolved_band_box_color if (opening_band_text or closing_band_text) else None,
+                    "auto_music": bool(selected_music),
+                    "music_file": selected_music,
+                    "music_volume": _normalize_music_volume(music_volume) if selected_music else None,
+                },
             )
             plan_path = write_enhance_plan(plan, enhance_plan_path)
             click.echo(f"  Enhancement plan: {plan_path}")
@@ -718,21 +1189,73 @@ def index_command(videos, backend, model, force_reindex, verbose):
               help="Optional target final video duration in minutes for the script writer.")
 @click.option("--output-layout", type=click.Choice(OUTPUT_LAYOUT_CHOICES), default="landscape", show_default=True,
               help="Final video shape: landscape (橫式) or portrait (直式).")
+@click.option("--weight", "weight_args", multiple=True,
+              metavar="FILE[:FLAG]",
+              help="Mark a source file as mandatory (e.g. --weight 'vid.mp4' or --weight 'vid.mp4:1'). "
+                   "Mandatory files are guaranteed to appear in the final edit. "
+                   "May be repeated for multiple files.")
+@click.option("--opening-caption", default=None,
+              help="Optional opening caption/title card text to insert before the first clip.")
+@click.option("--opening-caption-duration", default=None, type=float, hidden=True,
+              help="Deprecated. Caption duration is now shared via AUTOCUT_CAPTION_DURATION_SECONDS.")
+@click.option("--closing-caption", default=None,
+              help="Optional closing caption/title card text to append after the last clip.")
+@click.option("--closing-caption-duration", default=None, type=float, hidden=True,
+              help="Deprecated. Caption duration is now shared via AUTOCUT_CAPTION_DURATION_SECONDS.")
+@click.option("--opening-band", default=None, hidden=True,
+              help="Deprecated: use .env AUTOCUT_BAND_TEXT. If AUTOCUT_BAND_TEXT is set, it applies to opening and closing cards.")
+@click.option("--closing-band", default=None, hidden=True,
+              help="Deprecated: use .env AUTOCUT_BAND_TEXT. If AUTOCUT_BAND_TEXT is set, it applies to opening and closing cards.")
+@click.option("--band-box-color", default=None,
+              help=f"FFmpeg drawtext box color for opening/closing band. Default: {BAND_BOX_COLOR_ENV} or {DEFAULT_BAND_BOX_COLOR}.")
 @click.option("--enhance", type=click.Choice(ENHANCE_PRESETS), default="none", show_default=True,
               help="Apply a final preset-based video/audio enhancement pass.")
 @click.option("--enhance-plan", default=None,
               type=click.Path(dir_okay=False),
               help="Write enhancement plan JSON here. Defaults to OUTPUT.enhance-plan.json when --enhance is used.")
+@click.option("--auto-music", is_flag=True,
+              help=f"Automatically choose background music from {MUSIC_DIR_ENV}.")
+@click.option("--music-dir", default=None, hidden=True,
+              type=click.Path(exists=True, file_okay=False),
+              help=f"Directory of music files. Defaults to {MUSIC_DIR_ENV}.")
+@click.option("--music-volume", default=None, type=float, hidden=True,
+              help=f"Background music volume multiplier. Default: AUTOCUT_MUSIC_VOLUME or {DEFAULT_MUSIC_VOLUME:g}.")
 @click.option("--verbose", is_flag=True)
 def create(videos, prompt, output, backend, model,
            hq_dir, force_reindex, auto_prompt, script_api_base,
            script_api_key, script_api_model, script_api_max_tokens,
            catalog_max_chars, target_duration_minutes, output_layout,
-           enhance, enhance_plan, verbose):
+           weight_args,
+           opening_caption, opening_caption_duration,
+           closing_caption, closing_caption_duration,
+           opening_band, closing_band, band_box_color,
+           enhance, enhance_plan, auto_music, music_dir, music_volume, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
     model = model or _auto_model()
     output_path = str(Path(output).expanduser().resolve())
+
+    # Parse --weight args as mandatory flags: "filename" or legacy "filename:weight"
+    weight_files: dict[str, int] | None = None
+    if weight_args:
+        weight_files = {}
+        for w_arg in weight_args:
+            if ":" in w_arg:
+                fname, w_str = w_arg.rsplit(":", 1)
+                try:
+                    w = int(w_str)
+                except ValueError:
+                    click.echo(f"  ⚠ invalid required flag in '{w_arg}'; skipping.", err=True)
+                    continue
+            else:
+                fname = w_arg
+                w = 1
+            fname = str(fname).strip()
+            if w > 0 and fname:
+                weight_files[fname] = 1
+        if weight_files:
+            readable_required = [os.path.basename(k) if os.path.basename(k) else k for k in weight_files]
+            click.echo(f"  Mandatory files: {readable_required}")
 
     click.echo(f"autoCut Script Mode — {len(videos)} video(s)")
     click.echo(f"Backend: {backend}  Output: {output_path}")
@@ -772,11 +1295,14 @@ def create(videos, prompt, output, backend, model,
         script_api_model=script_api_model,
         script_api_max_tokens=script_api_max_tokens,
         target_duration_minutes=target_duration_minutes,
+        weight_files=weight_files,
     )
     click.echo(f"  AI suggested {len(script)} clip(s).")
 
     # 4. validate
     selected = validate_script(script, rows)
+    # Ensure mandatory files are represented
+    selected = _ensure_weighted_files(selected, rows, weight_files)
     click.echo(f"  {len(selected)} valid clip(s).")
     for s in selected:
         narration = s.get("narration", "")
@@ -797,6 +1323,16 @@ def create(videos, prompt, output, backend, model,
         output_layout=output_layout,
         enhance=enhance,
         enhance_plan_path=str(Path(enhance_plan).expanduser().resolve()) if enhance_plan else None,
+        opening_caption=opening_caption,
+        opening_caption_duration=opening_caption_duration,
+        closing_caption=closing_caption,
+        closing_caption_duration=closing_caption_duration,
+        opening_band=opening_band,
+        closing_band=closing_band,
+        band_box_color=band_box_color,
+        auto_music=auto_music,
+        music_dir=music_dir,
+        music_volume=music_volume,
     )
 
     click.echo(f"\nDone: {output_path}")

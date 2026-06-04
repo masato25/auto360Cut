@@ -8,6 +8,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from .base import BaseTab
+from ..settings import is_verbose_enabled
+from ..utils import bind_listbox_double_click_to_play, play_selected_listbox_video
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -19,7 +21,6 @@ class IndexTab(BaseTab):
     def __init__(self, parent, app):
         self.index_files: list[str] = []
         self.index_backend = tk.StringVar(value="local-api")
-        self.index_verbose = tk.BooleanVar(value=False)
         self.index_force_reindex = tk.BooleanVar(value=False)
         super().__init__(parent, app)
 
@@ -32,9 +33,11 @@ class IndexTab(BaseTab):
         lrow.pack(fill=tk.X, pady=(4, 0))
         self.index_listbox = tk.Listbox(lrow, height=7, font=("Menlo", 10))
         self.index_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        bind_listbox_double_click_to_play(self.index_listbox, self.index_files)
         btn_frame = ttk.Frame(lrow)
         btn_frame.pack(side=tk.RIGHT, padx=(6, 0), fill=tk.Y)
         ttk.Button(btn_frame, text="新增影片…", command=self._add_files).pack(pady=(0, 4))
+        ttk.Button(btn_frame, text="播放選取", command=self._play_selected).pack(pady=(0, 4))
         ttk.Button(btn_frame, text="移除選取", command=self._remove_selected).pack(pady=(0, 4))
         ttk.Button(btn_frame, text="清空", command=self._clear_files).pack()
 
@@ -44,16 +47,14 @@ class IndexTab(BaseTab):
         ttk.Combobox(opts, textvariable=self.index_backend,
                      values=["local-api", "local", "qwen-cloud", "gemini"],
                      state="readonly", width=12).grid(row=0, column=1, sticky=tk.W, padx=(0, 20))
-        ttk.Checkbutton(opts, text="詳細日誌",
-                        variable=self.index_verbose).grid(row=0, column=2, sticky=tk.W, padx=(0, 12))
         ttk.Checkbutton(opts, text="強制重建索引",
-                        variable=self.index_force_reindex).grid(row=0, column=3, sticky=tk.W)
+                        variable=self.index_force_reindex).grid(row=0, column=2, sticky=tk.W)
 
         ttk.Label(
             self,
             text="提示：如果只是新增素材，不用勾強制重建；改了 360 視角提示或想刷新舊資料才需要重建。",
             foreground="gray",
-            wraplength=620,
+            wraplength=500,
         ).pack(fill=tk.X, pady=(0, 6))
 
         self._run_btn = ttk.Button(self, text=self.IDLE_LABEL, command=self._run)
@@ -68,6 +69,9 @@ class IndexTab(BaseTab):
             if f not in self.index_files:
                 self.index_files.append(f)
                 self.index_listbox.insert(tk.END, Path(f).name)
+
+    def _play_selected(self) -> None:
+        play_selected_listbox_video(self.index_listbox, self.index_files)
 
     def _remove_selected(self) -> None:
         sel = self.index_listbox.curselection()
@@ -122,7 +126,8 @@ class IndexTab(BaseTab):
         ]
         if self.index_force_reindex.get():
             args.append("--force-reindex")
-        if self.index_verbose.get():
+        verbose_enabled = is_verbose_enabled()
+        if verbose_enabled:
             args.append("--verbose")
 
         self.app.clear_log()

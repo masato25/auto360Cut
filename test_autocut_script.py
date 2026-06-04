@@ -1,9 +1,22 @@
 
+from pathlib import Path
+
 from autocut_script import (
     OUTPUT_LAYOUT_CHOICES,
+    DEFAULT_CAPTION_DURATION,
     _build_script_system_prompt,
     _choose_output_layout,
     _coerce_script_response,
+    _escape_drawtext_text,
+    _opening_caption_drawtext_filter,
+    _band_caption_drawtext_filter,
+    _opening_caption_fontfile,
+    _normalize_opening_caption_duration,
+    _music_candidates,
+    _select_music_file,
+    _normalize_music_volume,
+    render,
+    _opening_caption_dimensions,
     _normalize_openai_base_url,
     _parse_json_or_recover_clips,
     _parse_time,
@@ -37,6 +50,61 @@ def test_choose_output_layout_rejects_auto() -> None:
         assert "portrait" in str(exc)
     else:
         raise AssertionError("auto layout should not be accepted")
+
+
+def test_opening_caption_dimensions_follow_layout() -> None:
+    assert _opening_caption_dimensions("landscape") == (1280, 720)
+    assert _opening_caption_dimensions("portrait") == (1080, 1920)
+
+
+def test_opening_caption_duration_default_and_positive() -> None:
+    assert _normalize_opening_caption_duration(None) == DEFAULT_CAPTION_DURATION
+    assert _normalize_opening_caption_duration(2.5) == 2.5
+
+
+def test_opening_caption_duration_rejects_non_positive() -> None:
+    try:
+        _normalize_opening_caption_duration(0)
+    except ValueError as exc:
+        assert "positive" in str(exc)
+    else:
+        raise AssertionError("zero duration should be rejected")
+
+
+def test_escape_drawtext_text_escapes_special_chars() -> None:
+    escaped = _escape_drawtext_text("A:B's 100%\\nok")
+    assert r"A\:B\'s 100\%" in escaped
+    assert r"\n" in escaped
+
+
+def test_opening_caption_drawtext_filter_uses_boxed_white_text(monkeypatch) -> None:
+    monkeypatch.setenv("AUTOCUT_OPENING_CAPTION_FONT", "/tmp/Noto Sans CJK.ttc")
+
+    vf = _opening_caption_drawtext_filter("旅程開始", layout="landscape")
+
+    assert "fontfile='/tmp/Noto Sans CJK.ttc'" in vf
+    assert "text='旅程開始'" in vf
+    assert "fontcolor=white" in vf
+    assert "box=1" in vf
+    assert "boxcolor=black@1.0" in vf
+
+
+def test_band_caption_drawtext_filter_uses_bottom_right_and_custom_box_color(monkeypatch) -> None:
+    monkeypatch.setenv("AUTOCUT_OPENING_CAPTION_FONT", "/tmp/Noto Sans CJK.ttc")
+
+    vf = _band_caption_drawtext_filter("Channel A", layout="landscape", box_color="blue@0.7")
+
+    assert "text='Channel A'" in vf
+    assert "x=w-text_w-48" in vf
+    assert "y=h-text_h-48" in vf
+    assert "fontsize=30" in vf
+    assert "boxcolor=blue@0.7" in vf
+
+
+def test_opening_caption_fontfile_honors_env(monkeypatch) -> None:
+    monkeypatch.setenv("AUTOCUT_OPENING_CAPTION_FONT", "/custom/cjk-font.ttc")
+
+    assert _opening_caption_fontfile() == "/custom/cjk-font.ttc"
 
 
 # ── _build_script_system_prompt ──────────────────────────────────────────────
@@ -246,6 +314,141 @@ def test_format_catalog_truncates_at_max_chars() -> None:
     truncated = format_catalog(rows, max_chars=50)
     assert len(truncated) <= len(full)
     assert "truncated" in truncated
+
+
+# ── background music ────────────────────────────────────────────────────────
+
+
+def test_music_candidates_reads_supported_audio_files(monkeypatch, tmp_path) -> None:
+    (tmp_path / "a.mp3").write_text("music", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("not music", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "c.WAV").write_text("music", encoding="utf-8")
+
+    monkeypatch.setenv("AUTOCUT_MUSIC_DIR", str(tmp_path))
+
+    assert _music_candidates() == [str((tmp_path / "a.mp3").resolve()), str((nested / "c.WAV").resolve())]
+
+
+def test_select_music_file_is_deterministic(tmp_path) -> None:
+    (tmp_path / "a.mp3").write_text("music", encoding="utf-8")
+    (tmp_path / "b.mp3").write_text("music", encoding="utf-8")
+    selected = [{"source_file": "clip.mp4", "start_time": 0, "end_time": 1}]
+
+    first = _select_music_file(selected=selected, output_path="out.mp4", music_dir=str(tmp_path))
+    second = _select_music_file(selected=selected, output_path="out.mp4", music_dir=str(tmp_path))
+
+    assert first == second
+    assert first in {str((tmp_path / "a.mp3").resolve()), str((tmp_path / "b.mp3").resolve())}
+
+
+def test_normalize_music_volume_default_and_rejects_negative(monkeypatch) -> None:
+    monkeypatch.delenv("AUTOCUT_MUSIC_VOLUME", raising=False)
+    assert _normalize_music_volume(None) == 0.18
+    assert _normalize_music_volume("0.3") == 0.3
+    try:
+        _normalize_music_volume(-0.1)
+    except ValueError as exc:
+        assert "non-negative" in str(exc)
+    else:
+        raise AssertionError("negative volume should be rejected")
+
+
+# ── render caption ordering ─────────────────────────────────────────────────
+
+
+def test_render_env_band_text_applies_to_opening_and_closing(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AUTOCUT_BAND_TEXT", "Channel")
+    rendered_titles = []
+    normalized = []
+    concat_files = []
+    mixed_music = []
+
+    def fake_get_ffmpeg() -> str:
+        return "ffmpeg"
+
+    def fake_render_caption(ffmpeg, *, text, output_path, layout, duration=None, band_text=None, band_box_color=None):
+        rendered_titles.append((text, output_path, duration, band_text, band_box_color))
+        Path(output_path).write_text(text, encoding="utf-8")
+        return output_path
+
+    def fake_normalize(ffmpeg, input_path, output_path, *, layout):
+        normalized.append(output_path)
+        Path(output_path).write_text("clip", encoding="utf-8")
+        return output_path
+
+    def fake_apply_music(ffmpeg, input_path, output_path, music_path, *, volume=None):
+        mixed_music.append((input_path, output_path, music_path, volume))
+        Path(output_path).write_text("music output", encoding="utf-8")
+        return output_path
+
+    def fake_run(cmd, capture_output=True, text=True):
+        if "concat" in cmd:
+            list_path = Path(cmd[cmd.index("-i") + 1])
+            concat_files.extend(
+                line.split("'", 2)[1]
+                for line in list_path.read_text(encoding="utf-8").splitlines()
+            )
+            Path(cmd[-1]).write_text("output", encoding="utf-8")
+        class Result:
+            returncode = 0
+            stderr = ""
+        return Result()
+
+    monkeypatch.setattr("autocut_script._get_ffmpeg", fake_get_ffmpeg)
+    monkeypatch.setattr("autocut_script._render_opening_caption_clip", fake_render_caption)
+    monkeypatch.setattr("autocut_script._normalize_clip_for_concat", fake_normalize)
+    monkeypatch.setattr("autocut_script._apply_background_music", fake_apply_music)
+    monkeypatch.setattr("autocut_script._resolve_hq_source", lambda source_file, hq_dir=None: source_file)
+    monkeypatch.setattr("autocut_script.subprocess.run", fake_run)
+
+    import sys
+    import types
+    trimmer = types.ModuleType("sentrysearch.trimmer")
+    def fake_trim_clip(source_file, start_time, end_time, output_path, padding=1.0):
+        Path(output_path).write_text("raw", encoding="utf-8")
+    trimmer.trim_clip = fake_trim_clip
+    sentrysearch = types.ModuleType("sentrysearch")
+    sentrysearch.trimmer = trimmer
+    monkeypatch.setitem(sys.modules, "sentrysearch", sentrysearch)
+    monkeypatch.setitem(sys.modules, "sentrysearch.trimmer", trimmer)
+
+    music_dir = tmp_path / "music"
+    music_dir.mkdir()
+    music_file = music_dir / "track.mp3"
+    music_file.write_text("music", encoding="utf-8")
+
+    output = tmp_path / "out.mp4"
+    render(
+        [{"source_file": "clip.mp4", "start_time": 0, "end_time": 1}],
+        output_path=str(output),
+        hq_dir=None,
+        output_layout="landscape",
+        opening_caption="Start",
+        opening_caption_duration=1.5,
+        closing_caption="End",
+        closing_caption_duration=2.5,
+        opening_band="Channel",
+        closing_band="Subscribe",
+        band_box_color="blue@0.7",
+        auto_music=True,
+        music_dir=str(music_dir),
+        music_volume=0.25,
+    )
+
+    # Opening/closing captions intentionally share one duration; if both legacy
+    # args are passed, opening_caption_duration wins for compatibility.
+    assert rendered_titles == [
+        ("Start", str(tmp_path / "out_opening_caption.mp4"), 1.5, "Channel", "blue@0.7"),
+        ("End", str(tmp_path / "out_closing_caption.mp4"), 1.5, "Channel", "blue@0.7"),
+    ]
+    assert concat_files == [str(tmp_path / "out_opening_caption.mp4"), str(tmp_path / "out_0_norm.mp4"), str(tmp_path / "out_closing_caption.mp4")]
+    assert len(mixed_music) == 1
+    assert mixed_music[0][1] == str(tmp_path / "out_music.mp4")
+    assert mixed_music[0][2] == str(music_file.resolve())
+    assert mixed_music[0][3] == 0.25
+    assert output.exists()
 
 
 # ── _normalize_openai_base_url ───────────────────────────────────────────────

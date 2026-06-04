@@ -16,6 +16,7 @@ or audio sources are concatenated.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -57,32 +58,32 @@ _PRESETS: dict[str, EnhanceSettings] = {
     "light": EnhanceSettings(
         preset="light",
         video_filter="eq=contrast=1.04:saturation=1.08:brightness=0.01,unsharp=5:5:0.45:3:3:0.2",
-        audio_filter="loudnorm=I=-16:TP=-1.5:LRA=11",
+        audio_filter=None,
         video_codec="libx264",
         crf="21",
         preset_speed="medium",
         audio_bitrate="160k",
-        description="Subtle contrast/saturation/sharpening plus loudness normalization.",
+        description="Subtle contrast/saturation/sharpening (audio filter removed to prevent sync issues).",
     ),
     "vivid": EnhanceSettings(
         preset="vivid",
         video_filter="eq=contrast=1.08:saturation=1.18:brightness=0.015,unsharp=5:5:0.65:3:3:0.25",
-        audio_filter="loudnorm=I=-16:TP=-1.5:LRA=10",
+        audio_filter=None,
         video_codec="libx264",
         crf="20",
         preset_speed="medium",
         audio_bitrate="192k",
-        description="Punchier colors and sharpening for travel/action footage.",
+        description="Punchier colors and sharpening for travel/action footage (audio filter removed to prevent sync issues).",
     ),
     "cinematic": EnhanceSettings(
         preset="cinematic",
         video_filter="eq=contrast=1.10:saturation=1.05:brightness=-0.005,unsharp=5:5:0.35:3:3:0.15",
-        audio_filter="highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=12",
+        audio_filter=None,
         video_codec="libx264",
         crf="20",
         preset_speed="medium",
         audio_bitrate="192k",
-        description="Slightly deeper contrast with restrained saturation and cleaned voice/music lows.",
+        description="Slightly deeper contrast with restrained saturation (audio filter removed to prevent sync issues).",
     ),
 }
 
@@ -122,6 +123,34 @@ def write_enhance_plan(plan: dict[str, Any], plan_path: str | None = None) -> st
 
 
 # ── ffmpeg arg builders ───────────────────────────────────────────────
+@functools.lru_cache(maxsize=None)
+def ffmpeg_supports_encoder(ffmpeg: str, encoder: str) -> bool:
+    """Return whether the selected ffmpeg binary advertises a video encoder."""
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    return any(encoder in line.split() for line in result.stdout.splitlines())
+
+
+def ffmpeg_video_encode_args(ffmpeg: str, *, preset_speed: str = "medium", crf: str = "18") -> list[str]:
+    """Choose compatible video encode args, preferring H.264 when available."""
+    if ffmpeg_supports_encoder(ffmpeg, "libx264"):
+        return ["-c:v", "libx264", "-preset", preset_speed, "-crf", crf]
+    # Compatibility fallback for ffmpeg builds without libx264.  mpeg4 does not
+    # support -preset/-crf, so use a high-quality quantizer instead.
+    return ["-c:v", "mpeg4", "-q:v", "2"]
+
+
+_LOUDNORM_TARGET_RE = re.compile(r"loudnorm=I=([^:]+):TP=([^:]+):LRA=([^:,\]]+)")
+
+
 def _loudnorm_measure_args(audio_filter: str) -> list[str]:
     """First-pass loudnorm: measure only, print JSON stats to stderr.
 
@@ -149,7 +178,7 @@ _LOUDNORM_STATS_RE = re.compile(
 
 
 def _measure_loudnorm(ffmpeg: str, input_path: str,
-                     audio_filter: str) -> dict[str, str] | None:
+                      audio_filter: str) -> dict[str, str] | None:
     """Run a null-encode to collect loudnorm statistics.
 
     Uses the same I/TP/LRA targets as *audio_filter* so the measurement
@@ -161,10 +190,12 @@ def _measure_loudnorm(ffmpeg: str, input_path: str,
     """
     result = subprocess.run(
         [ffmpeg, "-y", "-i", input_path, *_loudnorm_measure_args(audio_filter)],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
-    # loudnorm JSON is printed to stderr
-    combined = result.stderr + result.stdout
+    # loudnorm JSON is printed to stderr.  Some tests monkeypatch
+    # subprocess.run with a lightweight result object that only exposes stderr.
+    combined = getattr(result, "stderr", "") + getattr(result, "stdout", "")
     m = _LOUDNORM_STATS_RE.search(combined)
     if not m:
         return None
@@ -175,9 +206,6 @@ def _measure_loudnorm(ffmpeg: str, input_path: str,
         "measured_thresh": m.group(4),
         "measured_offset": m.group(5),
     }
-
-
-_LOUDNORM_TARGET_RE = re.compile(r"loudnorm=I=([^:]+):TP=([^:]+):LRA=([^:,\]]+)")
 
 
 def _build_loudnorm_filter(audio_filter: str, measured: dict[str, str]) -> str:
@@ -206,13 +234,15 @@ def _build_loudnorm_filter(audio_filter: str, measured: dict[str, str]) -> str:
     )
 
 
-def ffmpeg_enhance_args(settings: EnhanceSettings,
+def ffmpeg_enhance_args(settings: EnhanceSettings, ffmpeg: str | None = None,
                         measured: dict[str, str] | None = None) -> list[str]:
     """Build the ffmpeg argument list for an enhancement encode.
 
     When *measured* is provided (from a prior two-pass loudnorm measurement),
-    the loudnorm filter in *settings.audio_filter* is rewritten to use
-    measured values for sample-accurate normalisation.
+    the loudnorm filter in *settings.audio_filter* is rewritten to use measured
+    values for sample-accurate normalisation.  Video encoder args are selected
+    for the concrete ffmpeg binary when supplied, falling back to the preset's
+    declared codec settings otherwise.
     """
     args: list[str] = []
     if settings.video_filter:
@@ -222,14 +252,13 @@ def ffmpeg_enhance_args(settings: EnhanceSettings,
         af = _build_loudnorm_filter(af, measured)
     if af:
         args.extend(["-af", af])
+    if ffmpeg:
+        args.extend(ffmpeg_video_encode_args(ffmpeg, preset_speed=settings.preset_speed, crf=settings.crf))
+    else:
+        args.extend(["-c:v", settings.video_codec, "-preset", settings.preset_speed, "-crf", settings.crf])
     args.extend([
-        "-c:v", settings.video_codec,
-        "-preset", settings.preset_speed,
-        "-crf", settings.crf,
         "-c:a", "aac",
         "-b:a", settings.audio_bitrate,
-        "-ar", "48000",
-        "-ac", "2",
         "-movflags", "+faststart",
     ])
     return args
@@ -260,7 +289,7 @@ def apply_enhancement(ffmpeg: str, input_path: str, output_path: str, *,
     try:
         result = subprocess.run(
             [ffmpeg, "-y", "-i", input_path,
-             *ffmpeg_enhance_args(settings, measured=measured), tmp_output],
+             *ffmpeg_enhance_args(settings, ffmpeg=ffmpeg, measured=measured), tmp_output],
             capture_output=True,
             text=True,
         )
@@ -282,10 +311,14 @@ def apply_audio_normalize(ffmpeg: str, input_path: str,
     Video is stream-copied so this is fast and lossless for the picture.
     Useful as a "safety net" after concat even when ``--enhance none``.
     """
-    measured = _measure_loudnorm(ffmpeg, input_path, af)
     af = "loudnorm=I=-16:TP=-1.5:LRA=11"
-    if measured:
-        af = _build_loudnorm_filter(af, measured)
+    measured = _measure_loudnorm(ffmpeg, input_path, af)
+    if measured is None:
+        # Treat this as a best-effort safety net: skip normalisation when the
+        # input has no measurable audio stream or ffmpeg cannot report loudnorm
+        # stats, instead of failing an otherwise successful render.
+        return
+    af = _build_loudnorm_filter(af, measured)
 
     tmp_output = f"{output_path}.audio-norm.tmp.mp4"
     try:
