@@ -30,6 +30,7 @@ from enhancement import (  # noqa: E402
     ENHANCE_PRESETS,
     apply_enhancement,
     build_enhance_plan,
+    ffmpeg_video_encode_args,
     get_enhance_settings,
     write_enhance_plan,
 )
@@ -784,7 +785,7 @@ def _render_opening_caption_clip(
             "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
             "-t", f"{duration:g}",
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            *ffmpeg_video_encode_args(ffmpeg, preset_speed="fast", crf="18"),
             "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
             "-shortest", "-movflags", "+faststart",
             output_path,
@@ -897,8 +898,8 @@ def _normalize_clip_for_concat(ffmpeg: str, input_path: str, output_path: str, *
             ffmpeg, "-y", "-i", input_path,
             "-vf", vf,
             *scale_args,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+            *ffmpeg_video_encode_args(ffmpeg, preset_speed="medium", crf="18"),
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart",
             output_path,
         ],
@@ -1055,7 +1056,7 @@ def render(selected: list[dict], *, output_path: str,
             for cf in clip_files:
                 f.write(f"file '{os.path.abspath(cf)}'\n")
 
-        # Clips were already normalized to identical H.264/AAC parameters, so
+        # Clips were already normalized to identical video/AAC parameters, so
         # stream-copy concat is safe and avoids a second generation loss.
         result = subprocess.run(
             [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,

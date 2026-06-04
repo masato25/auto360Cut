@@ -71,8 +71,7 @@ def trim_clip(
     if os.path.isfile(output_path) and os.path.getsize(output_path) > 1024:
         return output_path
 
-    # Attempt 2: re-encode with output seeking (more compatible, slower)
-    # Use mpeg4/aac which are built into every ffmpeg build (no libx264 needed)
+    # Attempt 2: re-encode with libx264/aac (high quality, widely compatible)
     reencode_result = subprocess.run(
         [
             ffmpeg_exe,
@@ -80,10 +79,11 @@ def trim_clip(
             "-i", source_file,
             "-ss", str(padded_start),
             "-t", str(length),
-            "-c:v", "mpeg4",
-            "-q:v", "5",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "18",
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "192k",
             output_path,
         ],
         capture_output=True,

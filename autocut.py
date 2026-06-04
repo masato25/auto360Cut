@@ -50,6 +50,7 @@ from enhancement import (  # noqa: E402
     ENHANCE_PRESETS,
     apply_enhancement,
     build_enhance_plan,
+    ffmpeg_video_encode_args,
     get_enhance_settings,
     write_enhance_plan,
 )
@@ -912,7 +913,8 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
             click.echo("Stream copy failed, re-encoding...")
             result = subprocess.run(
                 [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", clip_list_path,
-                 "-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", output_path],
+                 *ffmpeg_video_encode_args(ffmpeg, preset_speed="medium", crf="18"),
+                 "-c:a", "aac", "-b:a", "192k", output_path],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:

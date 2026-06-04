@@ -7,6 +7,7 @@ plan JSON so users can see exactly which filters/codec settings were used.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -108,16 +109,42 @@ def write_enhance_plan(plan: dict[str, Any], plan_path: str | None = None) -> st
     return output
 
 
-def ffmpeg_enhance_args(settings: EnhanceSettings) -> list[str]:
+@functools.lru_cache(maxsize=None)
+def ffmpeg_supports_encoder(ffmpeg: str, encoder: str) -> bool:
+    """Return whether the selected ffmpeg binary advertises a video encoder."""
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    return any(encoder in line.split() for line in result.stdout.splitlines())
+
+
+def ffmpeg_video_encode_args(ffmpeg: str, *, preset_speed: str = "medium", crf: str = "18") -> list[str]:
+    """Choose compatible video encode args, preferring H.264 when available."""
+    if ffmpeg_supports_encoder(ffmpeg, "libx264"):
+        return ["-c:v", "libx264", "-preset", preset_speed, "-crf", crf]
+    # Compatibility fallback for ffmpeg builds without libx264.  mpeg4 does not
+    # support -preset/-crf, so use a high bitrate instead.
+    return ["-c:v", "mpeg4", "-q:v", "2"]
+
+
+def ffmpeg_enhance_args(settings: EnhanceSettings, ffmpeg: str | None = None) -> list[str]:
     args: list[str] = []
     if settings.video_filter:
         args.extend(["-vf", settings.video_filter])
     # NOTE: -af (audio filter) removed to prevent audio/video sync issues
     # caused by loudnorm/highpass filters. Only video filters are applied.
+    if ffmpeg:
+        args.extend(ffmpeg_video_encode_args(ffmpeg, preset_speed=settings.preset_speed, crf=settings.crf))
+    else:
+        args.extend(["-c:v", settings.video_codec, "-preset", settings.preset_speed, "-crf", settings.crf])
     args.extend([
-        "-c:v", settings.video_codec,
-        "-preset", settings.preset_speed,
-        "-crf", settings.crf,
         "-c:a", "aac",
         "-b:a", settings.audio_bitrate,
         "-movflags", "+faststart",
@@ -132,7 +159,7 @@ def apply_enhancement(ffmpeg: str, input_path: str, output_path: str, *, preset:
     tmp_output = f"{output_path}.enhance.tmp.mp4"
     try:
         result = subprocess.run(
-            [ffmpeg, "-y", "-i", input_path, *ffmpeg_enhance_args(settings), tmp_output],
+            [ffmpeg, "-y", "-i", input_path, *ffmpeg_enhance_args(settings, ffmpeg), tmp_output],
             capture_output=True,
             text=True,
         )
