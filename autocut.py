@@ -48,6 +48,7 @@ from sentrysearch.trimmer import trim_clip  # noqa: E402
 
 from enhancement import (  # noqa: E402
     ENHANCE_PRESETS,
+    apply_audio_normalize,
     apply_enhancement,
     build_enhance_plan,
     ffmpeg_video_encode_args,
@@ -932,6 +933,9 @@ def _render_autocut(selected: list[dict], *, source_video: str, output_path: str
             click.echo(f"Enhancement plan: {plan_path}")
             click.echo("Applying enhancement pass...")
             apply_enhancement(ffmpeg, output_path, output_path, preset=enhance_settings.preset)
+        else:
+            click.echo("Normalising audio loudness...")
+            apply_audio_normalize(ffmpeg, output_path, output_path)
         click.secho(f"\n✓ Auto-cut complete: {output_path}", fg="green", bold=True)
     finally:
         for cf in clip_files:

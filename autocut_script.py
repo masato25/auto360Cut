@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 
 from enhancement import (  # noqa: E402
     ENHANCE_PRESETS,
+    apply_audio_normalize,
     apply_enhancement,
     build_enhance_plan,
     ffmpeg_video_encode_args,
@@ -671,8 +672,13 @@ def _normalize_caption_duration(duration: float | int | str | None = None) -> fl
 
 
 def _normalize_opening_caption_duration(duration: float | int | str | None = None) -> float:
-    """Backward-compatible wrapper for the shared caption duration."""
-    return _normalize_caption_duration(duration)
+    """Backward-compatible wrapper for older callers/tests.
+
+    Historically this helper ignored environment configuration and returned the
+    built-in default when called with ``None``.  Keep that contract while render
+    paths use ``_normalize_caption_duration`` for the shared env-aware setting.
+    """
+    return _normalize_caption_duration(DEFAULT_CAPTION_DURATION if duration is None else duration)
 
 
 _CJK_FONT_CANDIDATES = (
@@ -1104,6 +1110,9 @@ def render(selected: list[dict], *, output_path: str,
             click.echo(f"  Enhancement plan: {plan_path}")
             click.echo("  Applying enhancement pass...")
             apply_enhancement(ffmpeg, output_path, output_path, preset=enhance_settings.preset)
+        else:
+            click.echo("  Normalising audio loudness...")
+            apply_audio_normalize(ffmpeg, output_path, output_path)
 
         click.secho(f"\n✓ Script edit complete: {output_path}", fg="green", bold=True)
     finally:
