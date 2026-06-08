@@ -25,7 +25,20 @@ from autocut_script import (
     _source_key,
     format_catalog,
     validate_script,
+    _auto_model,
 )
+
+
+def test_auto_model_ignores_local_model_for_gemini(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_API_MODEL", "local-vlm-model")
+
+    assert _auto_model("gemini") is None
+
+
+def test_auto_model_uses_local_model_for_local_api(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_API_MODEL", "local-vlm-model")
+
+    assert _auto_model("local-api") == "local-vlm-model"
 
 
 def test_render_layout_filter_portrait_uses_vertical_canvas() -> None:

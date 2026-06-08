@@ -25,6 +25,13 @@ class SettingsTab(BaseTab):
             wraplength=560,
         ).pack(anchor=tk.W, pady=(2, 10))
 
+        quick = ttk.LabelFrame(self, text="快速套用")
+        quick.pack(fill=tk.X, pady=(0, 10))
+        ttk.Button(quick, text="llama.cpp/local-api + 自架 LLM", command=self._apply_local_self_hosted).pack(side=tk.LEFT, padx=(8, 4), pady=8)
+        ttk.Button(quick, text="Gemini VLM + DeepSeek LLM", command=self._apply_gemini_deepseek).pack(side=tk.LEFT, padx=4, pady=8)
+        ttk.Button(quick, text="只套用自架 LLM 腳本設定", command=self._apply_self_hosted_script).pack(side=tk.LEFT, padx=4, pady=8)
+        ttk.Button(quick, text="只套用 DeepSeek 腳本設定", command=self._apply_deepseek_script).pack(side=tk.LEFT, padx=4, pady=8)
+
         form = ttk.Frame(self)
         form.pack(fill=tk.X)
         form.columnconfigure(1, weight=1)
@@ -53,6 +60,8 @@ class SettingsTab(BaseTab):
                     width=10,
                 )
                 widget.grid(row=row, column=1, sticky=tk.W, pady=4)
+            elif key in {"AUTOCUT_SCRIPT_API_KEY", "GEMINI_API_KEY"}:
+                ttk.Entry(form, textvariable=var, show="•").grid(row=row, column=1, sticky=tk.EW, pady=4)
             elif key in {"AUTOCUT_OPENING_CAPTION_FONT", "AUTOCUT_MUSIC_DIR"}:
                 line = ttk.Frame(form)
                 line.grid(row=row, column=1, sticky=tk.EW, pady=4)
@@ -74,12 +83,13 @@ class SettingsTab(BaseTab):
         ttk.Label(
             self,
             text=(
-                "小提醒：一鍵腳本/腳本模式會使用這裡的預設後端；一般剪輯與索引頁籤仍可用下拉選單臨時覆蓋。"
-                "這裡也可設定 API 位址、模型、字幕秒數、Band、背景音樂與詳細日誌。"
+                "小提醒：AUTOCUT_BACKEND=local-api 時使用 LOCAL_API_BASE/MODEL 做本地 VLM/embedding；設為 gemini 時使用 GEMINI_API_KEY。"
+                "腳本生成固定看 AUTOCUT_SCRIPT_API_*：local-api 模式可填你自架的 OpenAI-compatible LLM，"
+                "Gemini VLM 模式則可用 DeepSeek（https://api.deepseek.com/v1 + deepseek-chat）。一般剪輯與索引頁籤仍可用下拉選單臨時覆蓋後端。"
             ),
             font=("", 9),
             foreground="gray",
-            wraplength=560,
+            wraplength=620,
         ).pack(fill=tk.X, pady=(10, 0))
 
     def load_state(self) -> None:
@@ -96,6 +106,32 @@ class SettingsTab(BaseTab):
 
     def reset_run_button(self) -> None:
         return
+
+    def _set_if_empty(self, key: str, value: str) -> None:
+        if key in self._vars and not self._vars[key].get().strip():
+            self._vars[key].set(value)
+
+    def _apply_self_hosted_script(self) -> None:
+        self._vars["AUTOCUT_SCRIPT_API_BASE"].set("http://0.0.0.0:8080/v1")
+        self._vars["AUTOCUT_SCRIPT_API_MODEL"].set("your-openai-compatible-llm")
+        if self._vars["AUTOCUT_SCRIPT_API_KEY"].get().strip() in {"", "your-deepseek-api-key", "your-api-key"}:
+            self._vars["AUTOCUT_SCRIPT_API_KEY"].set("not-needed")
+
+    def _apply_deepseek_script(self) -> None:
+        self._vars["AUTOCUT_SCRIPT_API_BASE"].set("https://api.deepseek.com/v1")
+        self._vars["AUTOCUT_SCRIPT_API_MODEL"].set("deepseek-chat")
+        if self._vars["AUTOCUT_SCRIPT_API_KEY"].get().strip() in {"", "not-needed", "your-api-key"}:
+            self._vars["AUTOCUT_SCRIPT_API_KEY"].set("your-deepseek-api-key")
+
+    def _apply_local_self_hosted(self) -> None:
+        self._vars["AUTOCUT_BACKEND"].set("local-api")
+        self._set_if_empty("LOCAL_API_BASE", "http://0.0.0.0:8080")
+        self._apply_self_hosted_script()
+
+    def _apply_gemini_deepseek(self) -> None:
+        self._vars["AUTOCUT_BACKEND"].set("gemini")
+        self._set_if_empty("GEMINI_API_KEY", "your-gemini-api-key")
+        self._apply_deepseek_script()
 
     def _browse_font(self) -> None:
         f = filedialog.askopenfilename(
@@ -121,6 +157,12 @@ class SettingsTab(BaseTab):
                 return
         if values.get("AUTOCUT_BAND_BOX_COLOR") and not values["AUTOCUT_BAND_BOX_COLOR"].strip():
             messagebox.showerror("錯誤", "Band 背景色不可只填空白；可留空使用預設 black@1.0")
+            return
+        if values.get("AUTOCUT_BACKEND") == "gemini" and values.get("GEMINI_API_KEY") in {"", "your-gemini-api-key"}:
+            messagebox.showerror("錯誤", "使用 Gemini 後端時請填入 GEMINI_API_KEY")
+            return
+        if values.get("AUTOCUT_SCRIPT_API_KEY") in {"your-deepseek-api-key", "your-api-key"}:
+            messagebox.showerror("錯誤", "請將腳本 API Key 換成實際金鑰，或留空給本機 API 使用")
             return
         if values.get("AUTOCUT_SCRIPT_API_MAX_TOKENS"):
             try:

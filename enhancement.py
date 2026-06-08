@@ -185,8 +185,8 @@ def _measure_loudnorm(ffmpeg: str, input_path: str,
     corresponds to what the actual encode will use.
 
     Returns a dict with keys ``measured_I``, ``measured_TP``, ``measured_LRA``,
-    ``measured_thresh``, ``measured_offset``, or ``None`` if the measurement
-    pass failed (e.g. no audio stream).
+    ``measured_thresh``, ``offset``, or ``None`` if the measurement pass failed
+    (e.g. no audio stream).
     """
     result = subprocess.run(
         [ffmpeg, "-y", "-i", input_path, *_loudnorm_measure_args(audio_filter)],
@@ -204,7 +204,7 @@ def _measure_loudnorm(ffmpeg: str, input_path: str,
         "measured_TP": m.group(2),
         "measured_LRA": m.group(3),
         "measured_thresh": m.group(4),
-        "measured_offset": m.group(5),
+        "offset": m.group(5),
     }
 
 
@@ -227,7 +227,7 @@ def _build_loudnorm_filter(audio_filter: str, measured: dict[str, str]) -> str:
             f":measured_TP={measured['measured_TP']}"
             f":measured_LRA={measured['measured_LRA']}"
             f":measured_thresh={measured['measured_thresh']}"
-            f":measured_offset={measured['measured_offset']}"
+            f":offset={measured['offset']}"
             f":print_format=summary"
         ),
         audio_filter,

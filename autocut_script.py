@@ -7,11 +7,9 @@ import hashlib
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 import click
 
@@ -53,8 +51,17 @@ def _auto_backend() -> str:
     return os.environ.get("AUTOCUT_BACKEND", "local-api")
 
 
-def _auto_model() -> str | None:
-    return os.environ.get("LOCAL_API_MODEL") or None
+def _auto_model(backend: str | None = None) -> str | None:
+    """Return a model override only for backends that accept --model.
+
+    Cloud backends such as Gemini manage their own model configuration; passing
+    LOCAL_API_MODEL through to them makes validation fail when users keep both
+    local-api and Gemini examples in the same .env file.
+    """
+    backend = backend or _auto_backend()
+    if backend in {"local", "local-api"}:
+        return os.environ.get("LOCAL_API_MODEL") or None
+    return None
 
 
 # ── 1. index ─────────────────────────────────────────────────────────
@@ -200,25 +207,6 @@ def _normalize_openai_base_url(api_base: str) -> str:
     return base_url
 
 
-def _check_api_tcp_connectivity(base_url: str, timeout: float = 3.0) -> tuple[bool, str]:
-    """Check whether the script API host:port is reachable before SDK call."""
-    parsed = urlparse(base_url)
-    host = parsed.hostname
-    if not host:
-        return False, f"cannot parse host from API URL: {base_url}"
-    if parsed.port:
-        port = parsed.port
-    elif parsed.scheme == "https":
-        port = 443
-    else:
-        port = 80
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True, f"{host}:{port} reachable"
-    except OSError as exc:
-        return False, f"cannot connect to {host}:{port} ({exc})"
-
-
 _HIGHLIGHT_INSTRUCTION = (
     "\nEditing strategy: Treat this as a highlight edit, not an even summary. "
     "Do not distribute selections evenly across files and do not keep mediocre shots just for completeness. "
@@ -340,39 +328,34 @@ def _call_script_api(
         return data["choices"][0]["message"]["content"]
 
     try:
-        from openai import OpenAI, APIStatusError
+        from openai import OpenAI, APIConnectionError, APITimeoutError, APIStatusError
         click.echo(f"  Script API: {base_url}  Model: {model}", err=True)
-        ok, detail = _check_api_tcp_connectivity(base_url)
-        if ok:
-            if verbose:
-                click.echo(f"  API connectivity: {detail}", err=True)
-            client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
-            call_kwargs: dict = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_msg},
-                ],
-                "response_format": {"type": "json_object"},
-            }
-            if max_tokens is not None:
-                call_kwargs["max_tokens"] = max_tokens
-            try:
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
+        call_kwargs: dict = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        if max_tokens is not None:
+            call_kwargs["max_tokens"] = max_tokens
+        try:
+            resp = client.chat.completions.create(**call_kwargs)
+        except APIStatusError as api_err:
+            if "max_tokens" in call_kwargs and _is_unsupported_token_param_error(api_err):
+                call_kwargs.pop("max_tokens", None)
+                click.echo("  ⚠ token limit parameter not supported; retrying without it.", err=True)
                 resp = client.chat.completions.create(**call_kwargs)
-            except APIStatusError as api_err:
-                if "max_tokens" in call_kwargs and _is_unsupported_token_param_error(api_err):
-                    call_kwargs.pop("max_tokens", None)
-                    click.echo("  ⚠ token limit parameter not supported; retrying without it.", err=True)
-                    resp = client.chat.completions.create(**call_kwargs)
-                else:
-                    raise
-            return resp.choices[0].message.content
+            else:
+                raise
+        return resp.choices[0].message.content
+    except (APIConnectionError, APITimeoutError, OSError, ConnectionError) as net_err:
+        if verbose:
+            click.echo(f"  ⚠ OpenAI SDK connection failed ({type(net_err).__name__}: {net_err}); falling back to curl...", err=True)
         else:
-            if verbose:
-                click.echo(f"  API connectivity: {detail} — falling back to curl", err=True)
-            return _call_via_curl()
-    except (OSError, ConnectionError):
-        click.echo("  ⚠ Python network blocked; falling back to curl...", err=True)
+            click.echo("  ⚠ OpenAI SDK connection failed; falling back to curl...", err=True)
         return _call_via_curl()
     except Exception as e:
         click.echo(f"LLM call failed: {type(e).__name__}: {e}", err=True)
@@ -1146,7 +1129,7 @@ def cli():
 def index_command(videos, backend, model, force_reindex, verbose):
     """Index videos only, without creating or rendering an edit."""
     backend = backend or _auto_backend()
-    model = model or _auto_model()
+    model = model or _auto_model(backend)
 
     click.echo(f"autoCut Index — {len(videos)} video(s)")
     click.echo(f"Backend: {backend}")
@@ -1232,7 +1215,7 @@ def create(videos, prompt, output, backend, model,
            enhance, enhance_plan, auto_music, music_dir, music_volume, verbose):
     """Index videos, ask AI for an edit script, render the result."""
     backend = backend or _auto_backend()
-    model = model or _auto_model()
+    model = model or _auto_model(backend)
     output_path = str(Path(output).expanduser().resolve())
 
     # Parse --weight args as mandatory flags: "filename" or legacy "filename:weight"
