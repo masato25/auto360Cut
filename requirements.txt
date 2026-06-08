@@ -9,5 +9,6 @@
 
 click>=8.1
 python-dotenv>=1.0
+pydantic>=2.7
 setuptools>=68
 wheel>=0.42
